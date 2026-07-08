@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--raw-samples", type=int, default=1024)
     parser.add_argument("--max-restarts", type=int, default=16)
+    parser.add_argument("--minimize", action="store_true", help="minimize the objective (default: maximize)")
     args = parser.parse_args()
 
     xs, ys = experiment_io.load_dataset(args.exp_dir)
@@ -69,6 +70,9 @@ def main():
             f"No completed (config, run) pairs in {args.exp_dir}; "
             "run initial_design.py and mock_experiment.py first."
         )
+
+    if not args.minimize:
+        ys = -ys
 
     print(f"Loaded {len(xs)} observations, best so far: {ys.min():.6f}")
     print("Fitting surrogate and optimizing expected improvement...")
