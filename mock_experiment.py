@@ -1,13 +1,3 @@
-"""Run a full mock Bayesian-optimization experiment end to end.
-
-For a 2D virtual_library target: samples an initial design, mock-evaluates it,
-then loops BO iterations. Each iteration saves an expected-improvement heatmap
-(bo_step_{i}.png), and at the end the true target function heatmap is saved
-(mock_experiment.png) with every evaluated point.
-
-    uv run python mock_experiment.py --exp-dir experiments/ackley_2d --iterations 12
-"""
-
 import argparse
 import os
 

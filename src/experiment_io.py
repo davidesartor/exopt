@@ -1,16 +1,55 @@
-import glob
+import io
 import os
+import posixpath
 import re
 
 import jax.numpy as jnp
 import pandas as pd
+import paramiko
 from jaxtyping import Array, Float
+
+# --- Raspberry Pi connection (hardcoded; password overridable via env) ---
+PI_HOST = "172.30.207.3"
+PI_USER = "pi"
+PI_PASSWORD = os.environ.get("PI_PASSWORD", "R0boT21!")
+
+_sftp: paramiko.SFTPClient | None = None
+
+
+def _pi() -> paramiko.SFTPClient:
+    """Open (once) and return the SFTP client to the Pi."""
+    global _sftp
+    if _sftp is None:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(PI_HOST, username=PI_USER, password=PI_PASSWORD)
+        _sftp = client.open_sftp()
+    return _sftp
+
+
+def _makedirs(exp_dir: str) -> None:
+    """Recursive mkdir over SFTP (sftp.mkdir is not recursive)."""
+    sftp = _pi()
+    parents = []
+    p = exp_dir.rstrip("/")
+    while p and p not in ("/", "."):
+        parents.append(p)
+        p = posixpath.dirname(p)
+    for d in reversed(parents):
+        try:
+            sftp.mkdir(d)
+        except OSError:  # already exists
+            pass
 
 
 def _indices(exp_dir: str, prefix: str) -> set[int]:
+    try:
+        names = _pi().listdir(exp_dir)
+    except OSError:  # directory does not exist yet
+        return set()
     indices = set()
-    for f in glob.glob(os.path.join(exp_dir, f"{prefix}_*.txt")):
-        m = re.match(rf"{prefix}_(\d+)\.txt$", os.path.basename(f))
+    for name in names:
+        m = re.match(rf"{prefix}_(\d+)\.txt$", name)
         if m:
             indices.add(int(m.group(1)))
     return indices
@@ -33,14 +72,15 @@ def next_index(exp_dir: str) -> int:
 
 
 def read_config(exp_dir: str, i: int) -> Float[Array, "d"]:
-    with open(os.path.join(exp_dir, f"config_{i}.txt")) as f:
-        return jnp.array([float(v) for v in f.read().split()])
+    with _pi().open(posixpath.join(exp_dir, f"config_{i}.txt")) as f:
+        text = f.read().decode()
+    return jnp.array([float(v) for v in text.split()])
 
 
 def save_config(exp_dir: str, i: int, x: Float[Array, "d"]) -> None:
-    os.makedirs(exp_dir, exist_ok=True)
-    with open(os.path.join(exp_dir, f"config_{i}.txt"), "w") as f:
-        f.write(" ".join(str(float(v)) for v in x))
+    _makedirs(exp_dir)
+    with _pi().open(posixpath.join(exp_dir, f"config_{i}.txt"), "w") as f:
+        f.write(" ".join(str(float(v)) for v in x).encode())
 
 
 def loss_function(df: pd.DataFrame, beta: float = 5.0) -> float:
@@ -57,13 +97,16 @@ def loss_function(df: pd.DataFrame, beta: float = 5.0) -> float:
 
 def save_run(exp_dir: str, i: int, df: pd.DataFrame) -> None:
     """Write a raw hardware-like run dataframe as run_{i}.txt."""
-    os.makedirs(exp_dir, exist_ok=True)
-    df.to_csv(os.path.join(exp_dir, f"run_{i}.txt"), sep=" ", index=False)
+    _makedirs(exp_dir)
+    with _pi().open(posixpath.join(exp_dir, f"run_{i}.txt"), "w") as f:
+        f.write(df.to_csv(sep=" ", index=False).encode())
 
 
 def read_result(exp_dir: str, i: int) -> float:
     """Recover the scalar objective from run_{i}.txt via loss_function."""
-    df = pd.read_csv(os.path.join(exp_dir, f"run_{i}.txt"), sep=" ")
+    with _pi().open(posixpath.join(exp_dir, f"run_{i}.txt")) as f:
+        text = f.read().decode()
+    df = pd.read_csv(io.StringIO(text), sep=" ")
     return loss_function(df)
 
 
