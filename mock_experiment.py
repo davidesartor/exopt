@@ -8,9 +8,16 @@ import numpy as np
 import pandas as pd
 from jaxtyping import Array, Float, Scalar
 
-import bo_step
-import initial_design
-from src import experiment_io, gp, virtual_library
+from src import (
+    acquisition,
+    designs,
+    experiment_io,
+    gp,
+    rkhs,
+    strategy,
+    targets,
+    virtual_library,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -35,18 +42,19 @@ def plot_ei(
     @jax.jit
     def log_ei_at(x: Float[Array, "2"]) -> Scalar:
         mu, cov = surrogate_model.predict(x[None, :])
-        return gp.log_expected_improvement(
+        return acquisition.log_expected_improvement(
             mu=mu.squeeze(), sigma=cov.squeeze() ** 0.5, y_best=y_best
         )
 
-    g = jnp.linspace(0, 1, resolution)
+    lo, hi = designs.VECTOR_DOMAIN
+    g = jnp.linspace(lo, hi, resolution)
     gx, gy = jnp.meshgrid(g, g)
     pts = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
     log_ei = np.exp(jax.vmap(log_ei_at)(pts).reshape(gx.shape))
 
     fig, ax = plt.subplots(figsize=(6.5, 5.5), constrained_layout=True)
     hm = ax.imshow(
-        log_ei, origin="lower", extent=(0, 1, 0, 1), aspect="auto", cmap="viridis"
+        log_ei, origin="lower", extent=(lo, hi, lo, hi), aspect="auto", cmap="viridis"
     )
     fig.colorbar(hm, ax=ax, label="log expected improvement")
     ax.scatter(
@@ -70,8 +78,8 @@ def plot_ei(
     )
     ax.set_xlabel("x1")
     ax.set_ylabel("x2")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
     ax.set_title(f"iteration {iteration}: log expected improvement", color=INK)
     ax.legend(frameon=True, loc="upper right", fontsize=8)
 
@@ -90,7 +98,7 @@ def plot_experiment(exp_dir, target_fn, target_name):
     fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
 
     if dim == 1:
-        grid = jnp.linspace(0, 1, 400)[:, None]
+        grid = jnp.linspace(*designs.VECTOR_DOMAIN, 400)[:, None]
         ax.plot(grid[:, 0], target_fn(grid), color=LINE, lw=2, label=target_name)
         ax.scatter(xs[:, 0], ys, color=EVALS, s=40, zorder=3, label="evaluations")
         ax.scatter(xs[best, 0], ys[best], color=BEST, marker="*", s=320, zorder=4)
@@ -106,7 +114,7 @@ def plot_experiment(exp_dir, target_fn, target_name):
         ax.legend(frameon=False)
 
     elif dim == 2:
-        g = jnp.linspace(0, 1, 200)
+        g = jnp.linspace(*designs.VECTOR_DOMAIN, 200)
         gx, gy = jnp.meshgrid(g, g)
         z = target_fn(jnp.stack([gx, gy], axis=-1))
         cs = ax.contourf(gx, gy, z, levels=30, cmap="Blues_r")
@@ -140,6 +148,50 @@ def plot_experiment(exp_dir, target_fn, target_name):
     return path
 
 
+def plot_profiles(exp_dir, fs, ys, target_name):
+    """Save every evaluated torque profile, shaded by objective, best on top."""
+    grid = experiment_io.profile_grid(200)
+    best = int(jnp.argmin(ys))
+    order = np.argsort(-np.asarray(ys))  # worst first, so the good ones sit on top
+
+    fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
+    cmap = plt.get_cmap("viridis_r")
+    norm = plt.Normalize(float(ys.min()), float(ys.max()))
+    for j in order:
+        ax.plot(
+            grid.squeeze(-1), fs[j].sample(grid), color=cmap(norm(ys[j])), lw=1.2, alpha=0.8
+        )
+    ax.plot(
+        grid.squeeze(-1),
+        fs[best].sample(grid),
+        color=BEST,
+        lw=3,
+        zorder=5,
+        label=f"best {ys[best]:.3f}",
+    )
+    ax.scatter(
+        fs[best].x.squeeze(-1),
+        fs[best].sample(fs[best].x),
+        color=BEST,
+        marker="*",
+        s=250,
+        ec="white",
+        zorder=6,
+        label="adaptive basis points",
+    )
+    fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label="objective")
+    ax.set_xlabel("gait phase")
+    ax.set_ylabel("torque")
+    ax.set_title(f"{target_name}  ({len(ys)} profiles evaluated)", color=INK)
+    ax.legend(frameon=False)
+    ax.grid(True, color="0.9", zorder=0)
+
+    path = os.path.join(exp_dir, "mock_experiment_profiles.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
 def mock_run(y: float, timesteps: int = 100) -> pd.DataFrame:
     """Fabricate a hardware-like run dataframe whose loss_function recovers y.
 
@@ -162,32 +214,20 @@ def evaluate_pending(exp_dir, target_fn):
     pending = sorted(
         experiment_io.config_numbers(exp_dir) - experiment_io.run_numbers(exp_dir)
     )
+    if experiment_io.experiment_mode(exp_dir) == "functional":
+        read = experiment_io.read_config_function
+    else:
+        read = experiment_io.read_config
     for i in pending:
-        x = experiment_io.read_config(exp_dir, i)
+        x = read(exp_dir, i)
         experiment_io.save_run(exp_dir, i, mock_run(float(target_fn(x))))
     return pending
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exp-dir", required=True, help="experiment folder")
-    parser.add_argument("--target", default="Ackley", help="virtual_library function")
-    parser.add_argument("--dim", type=int, default=2, help="parameter dimension")
-    parser.add_argument("--initial", type=int, default=6, help="initial design size")
-    parser.add_argument("--iterations", type=int, default=12, help="BO iterations")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--edges", action="store_true", help="edge-prioritized initial design"
-    )
-    args = parser.parse_args()
-
-    target_fn = getattr(virtual_library, args.target)()
-
+def run_vector(args, target_fn):
     # step 1: initial design
-    if args.edges:
-        xs = initial_design.edge_prioritized(args.dim, args.initial, args.seed)
-    else:
-        xs = initial_design.latin_hypercube(args.dim, args.initial, args.seed)
+    sampler = designs.edge_prioritized if args.edges else designs.latin_hypercube
+    xs = sampler(args.dim, args.initial, args.seed, domain=designs.VECTOR_DOMAIN)
     for offset, x in enumerate(xs):
         experiment_io.save_config(args.exp_dir, offset + 1, x)
 
@@ -199,7 +239,7 @@ def main():
     # step 3: BO loop -- propose, plot EI heatmap, evaluate
     for it in range(args.iterations):
         xs, ys = experiment_io.load_dataset(args.exp_dir)
-        x_next, surrogate_model = bo_step.propose_next(xs, ys, seed=args.seed + it)
+        x_next, surrogate_model = strategy.propose_next(xs, ys, seed=args.seed + it)
 
         i = experiment_io.next_index(args.exp_dir)
         experiment_io.save_config(args.exp_dir, i, x_next)
@@ -218,6 +258,116 @@ def main():
     xs, ys = experiment_io.load_dataset(args.exp_dir)
     print(f"\nDone. Best found: {ys.min():.6f}")
     print(f"Saved final function heatmap to {path}")
+
+
+def run_functional(args, target_fn):
+    """Same loop, but the search variable is a torque profile, not a vector."""
+    rho = None if args.rho is None else jnp.full(1, args.rho)
+
+    # step 1: initial design in function space
+    fs = strategy.initial_functions(
+        k=args.initial_k, n=args.initial, seed=args.seed, edges=args.edges, rho=rho
+    )
+    for offset, f in enumerate(fs):
+        experiment_io.save_config_function(args.exp_dir, offset + 1, f)
+
+    # step 2: evaluate the initial design
+    evaluate_pending(args.exp_dir, target_fn)
+    fs, ys = experiment_io.load_functional_dataset(args.exp_dir)
+    print(f"Initial design: {len(fs)} profiles, best so far: {ys.min():.6f}")
+
+    # step 3: BO loop -- propose a profile, evaluate it
+    for it in range(args.iterations):
+        fs, ys = experiment_io.load_functional_dataset(args.exp_dir)
+        f_next, _ = strategy.propose_next_functional(
+            fs,
+            ys,
+            k=args.k,
+            seed=args.seed + it,
+            rho=rho,
+        )
+
+        i = experiment_io.next_index(args.exp_dir)
+        experiment_io.save_config_function(args.exp_dir, i, f_next)
+
+        y_next = float(target_fn(f_next))
+        experiment_io.save_run(args.exp_dir, i, mock_run(y_next))
+        print(
+            f"Iteration {it + 1}/{args.iterations}: "
+            f"y={y_next:.6f}, best={min(ys.min(), y_next):.6f}, "
+            f"rho={float(f_next.rho[0]):.3f}, "
+            f"basis phases={np.round(f_next.x.squeeze(-1), 3)}"
+        )
+
+    fs, ys = experiment_io.load_functional_dataset(args.exp_dir)
+    path = plot_profiles(args.exp_dir, fs, ys, args.target)
+    print(f"\nDone. Best found: {ys.min():.6f}")
+    print(f"Saved profile plot to {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exp-dir", required=True, help="experiment folder")
+    parser.add_argument(
+        "--mode",
+        choices=["vector", "functional"],
+        default="vector",
+        help="optimize a parameter vector, or a torque profile over gait phase",
+    )
+    parser.add_argument("--target", default="Ackley", help="virtual_library function")
+    parser.add_argument("--dim", type=int, default=2, help="parameter dimension")
+    parser.add_argument("--initial", type=int, default=6, help="initial design size")
+    parser.add_argument("--iterations", type=int, default=12, help="BO iterations")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--edges", action="store_true", help="edge-prioritized initial design"
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="write the experiment folder to the Pi instead of this machine",
+    )
+    # functional mode only
+    parser.add_argument(
+        "--k", type=int, default=4, help="number of adaptive basis points"
+    )
+    parser.add_argument(
+        "--initial-k",
+        type=int,
+        default=1,
+        help="basis points per initial-design profile (BOFUS seeds with one)",
+    )
+    parser.add_argument(
+        "--rho",
+        type=float,
+        default=None,
+        help="pin the lengthscale instead of adapting it (fixed-rho baseline)",
+    )
+    args = parser.parse_args()
+
+    # no hardware in the loop here, so stay on this machine unless asked
+    if not args.remote:
+        experiment_io.use_local_storage()
+        os.makedirs(args.exp_dir, exist_ok=True)
+
+    if args.mode == "functional":
+        if args.target in ("SincProjection", "sinc1d"):
+            # BOFUS's functional benchmark: depends on f everywhere
+            target_fn = targets.SincProjection(d=1, seed=args.seed)
+        elif args.target == "ProfileMatch":
+            # recover a reference torque profile: also depends on f everywhere
+            target_fn = targets.ProfileMatch()
+        else:
+            # lift a scalar benchmark to the functional domain over gait phase
+            profile = getattr(virtual_library, args.target)()
+            target_fn = targets.Ridge(profile, d=1, seed=args.seed)
+        run_functional(args, target_fn)
+    else:
+        # virtual_library functions are defined on the unit cube, so map the
+        # search domain onto it rather than moving every benchmark
+        profile = getattr(virtual_library, args.target)()
+        lo, hi = designs.VECTOR_DOMAIN
+        run_vector(args, lambda x: profile((x - lo) / (hi - lo)))
 
 
 if __name__ == "__main__":

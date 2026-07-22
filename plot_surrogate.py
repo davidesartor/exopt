@@ -10,7 +10,7 @@ import numpy as np
 import plotly.graph_objects as go
 from jaxtyping import Array, Float
 
-from src import experiment_io, gp
+from src import designs, experiment_io, gp
 
 jax.config.update("jax_enable_x64", True)
 
@@ -23,11 +23,11 @@ def surrogate_mean_grid(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate the surrogate posterior mean over a 2D slice of the domain.
 
-    The two axes in ``dims`` sweep the unit interval; every other dimension is
+    The two axes in ``dims`` sweep the search domain; every other dimension is
     held fixed at ``anchor`` (typically the incumbent best config).
     """
     d0, d1 = dims
-    g = jnp.linspace(0.0, 1.0, resolution)
+    g = jnp.linspace(*designs.VECTOR_DOMAIN, resolution)
     gx, gy = jnp.meshgrid(g, g)
 
     pts = jnp.broadcast_to(anchor, (gx.size, anchor.shape[0])).at[:, d0].set(
@@ -150,7 +150,15 @@ def main():
         help="which two parameter axes to plot (default 0 1)",
     )
     parser.add_argument("--resolution", type=int, default=150, help="grid resolution")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="read/write the experiment folder on this machine instead of the Pi",
+    )
     args = parser.parse_args()
+
+    if args.local:
+        experiment_io.use_local_storage()
 
     output = args.output or f"{os.path.basename(args.exp_dir.rstrip('/'))}_surrogate.html"
     path = plot(args.exp_dir, output, tuple(args.dims), args.resolution)

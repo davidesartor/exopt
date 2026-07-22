@@ -1,58 +1,13 @@
-from jaxtyping import Array, Float, Scalar
-import argparse
-import jax
-import jax.numpy as jnp
-import numpy as np
-import scipy as sp
+"""Propose the next config to run, from everything observed so far."""
 
-from src import experiment_io, gp
+import argparse
+import os
+
+import jax
+
+from src import experiment_io, strategy
 
 jax.config.update("jax_enable_x64", True)
-
-
-def propose_next(
-    xs: Float[Array, "n d"],
-    ys: Float[Array, "n"],
-    seed: int,
-    acquisition_raw_samples: int = 256,
-    acquisition_max_restarts: int = 5,
-) -> tuple[Float[Array, "d"], gp.GaussianProcess]:
-    dim = xs.shape[-1]
-    surrogate_model = gp.GaussianProcess().fit(xs, ys)
-
-    @jax.jit
-    @jax.value_and_grad
-    def acquisition_loss(x: Float[Array, "d"]) -> Scalar:
-        mu, cov = surrogate_model.predict(x[None, :])
-        return -gp.log_expected_improvement(
-            mu=mu.squeeze(),
-            sigma=cov.squeeze() ** 0.5,
-            y_best=surrogate_model.observed_ys.min(),
-        )
-
-    # restart L-BFGS-B from the best of a Latin hypercube of initial candidates
-    candidates = sp.stats.qmc.LatinHypercube(d=dim, rng=seed).random(
-        n=acquisition_raw_samples
-    )
-    losses = [acquisition_loss(c)[0] for c in candidates]
-    candidates = candidates[np.argsort(losses)[:acquisition_max_restarts]]
-
-    results = [
-        sp.optimize.minimize(
-            fun=acquisition_loss,
-            x0=c,
-            jac=True,
-            method="L-BFGS-B",
-            bounds=[(0.0, 1.0)] * dim,
-            options=dict(maxiter=100, ftol=gp.EPS, gtol=0.0),
-        )
-        for c in candidates
-    ]
-
-    # return the location of the best local optimum found and the fitted model
-    losses = jnp.array([result.fun for result in results])
-    x_next = jnp.array(results[jnp.argmin(losses)].x)
-    return x_next, surrogate_model
 
 
 def main():
@@ -61,32 +16,73 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--raw-samples", type=int, default=1024)
     parser.add_argument("--max-restarts", type=int, default=16)
-    parser.add_argument("--minimize", action="store_true", help="minimize the objective (default: maximize)")
+    parser.add_argument(
+        "--minimize",
+        action="store_true",
+        help="minimize the objective (default: maximize)",
+    )
+    # functional experiments only (detected from the folder, not passed in)
+    parser.add_argument(
+        "--k", type=int, default=4, help="number of adaptive basis points"
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="read/write the experiment folder on this machine instead of the Pi",
+    )
     args = parser.parse_args()
 
-    xs, ys = experiment_io.load_dataset(args.exp_dir)
-    if len(xs) == 0:
+    if args.local:
+        experiment_io.use_local_storage()
+        os.makedirs(args.exp_dir, exist_ok=True)
+
+    def report(n: int, ys):
+        if n == 0:
+            raise SystemExit(
+                f"No completed (config, run) pairs in {args.exp_dir}; "
+                "run initial_design.py and mock_experiment.py first."
+            )
+        print(f"Continuing a {mode} experiment.")
+        print(f"Loaded {n} observations, best so far: {ys.min():.6f}")
+        print("Fitting surrogate and optimizing expected improvement...")
+
+    # what to optimize is decided by whatever the history already holds
+    mode = experiment_io.experiment_mode(args.exp_dir)
+    if mode is None:
         raise SystemExit(
-            f"No completed (config, run) pairs in {args.exp_dir}; "
-            "run initial_design.py and mock_experiment.py first."
+            f"No configs in {args.exp_dir}; run initial_design.py first."
         )
 
-    if not args.minimize:
-        ys = -ys
-
-    print(f"Loaded {len(xs)} observations, best so far: {ys.min():.6f}")
-    print("Fitting surrogate and optimizing expected improvement...")
-    x_next, _ = propose_next(
-        xs,
-        ys,
-        seed=args.seed,
-        acquisition_raw_samples=args.raw_samples,
-        acquisition_max_restarts=args.max_restarts,
-    )
-
+    sign = 1.0 if args.minimize else -1.0
     i = experiment_io.next_index(args.exp_dir)
-    experiment_io.save_config(args.exp_dir, i, x_next)
-    print(f"Proposed next point -> config_{i}.txt: {x_next}")
+
+    if mode == "functional":
+        fs, ys = experiment_io.load_functional_dataset(args.exp_dir)
+        report(len(fs), sign * ys)
+        f_next, _ = strategy.propose_next_functional(
+            fs,
+            sign * ys,
+            k=args.k,
+            seed=args.seed,
+            acquisition_raw_samples=args.raw_samples,
+            acquisition_max_restarts=args.max_restarts,
+        )
+        experiment_io.save_config_function(args.exp_dir, i, f_next)
+        print(f"Proposed next profile -> config_{i}.json ({args.k} basis points)")
+        print(f"  lengthscale rho: {f_next.rho}")
+        print(f"  basis phases:    {f_next.x.squeeze(-1)}")
+    else:
+        xs, ys = experiment_io.load_dataset(args.exp_dir)
+        report(len(xs), sign * ys)
+        x_next, _ = strategy.propose_next(
+            xs,
+            sign * ys,
+            seed=args.seed,
+            acquisition_raw_samples=args.raw_samples,
+            acquisition_max_restarts=args.max_restarts,
+        )
+        experiment_io.save_config(args.exp_dir, i, x_next)
+        print(f"Proposed next point -> config_{i}.txt: {x_next}")
 
 
 if __name__ == "__main__":

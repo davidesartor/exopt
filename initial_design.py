@@ -1,47 +1,23 @@
+"""Write an initial space-filling design of configs into an experiment folder."""
+
 import argparse
-import itertools
+import os
 
 import jax.numpy as jnp
-import numpy as np
-import scipy as sp
-from jaxtyping import Array, Float
 
-from src import experiment_io
-
-
-def latin_hypercube(dim: int, n: int, seed: int) -> Float[Array, "n d"]:
-    sampler = sp.stats.qmc.LatinHypercube(d=dim, rng=seed)
-    return jnp.array(sampler.random(n=n))
-
-
-def edge_prioritized(
-    dim: int, n: int, seed: int, concentration: float = 0.5
-) -> Float[Array, "n d"]:
-    """Space-filling samples warped toward the domain edges.
-
-    Starts with the literal corners of the domain (the 2^d vertices of the
-    unit cube), in a seed-shuffled order so no corner is systematically
-    favored when n < 2^d, and the extremes are always evaluated first. Any
-    remaining slots are filled from a Latin hypercube pushed toward 0 or 1
-    via the Beta(a, a) inverse CDF with a = concentration < 1, which is
-    U-shaped and piles probability mass at the boundary.
-    """
-    corners = jnp.array(list(itertools.product([0.0, 1.0], repeat=dim)))
-    order = np.random.default_rng(seed).permutation(corners.shape[0])
-    corners = corners[order]
-    if n <= corners.shape[0]:
-        return corners[:n]
-
-    n_extra = n - corners.shape[0]
-    u = sp.stats.qmc.LatinHypercube(d=dim, rng=seed).random(n=n_extra)
-    extra = jnp.array(sp.stats.beta.ppf(u, concentration, concentration))
-    return jnp.concatenate([corners, extra], axis=0)
+from src import designs, experiment_io, strategy
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exp-dir", required=True, help="experiment folder")
-    parser.add_argument("--dim", type=int, required=True, help="parameter dimension")
+    parser.add_argument(
+        "--mode",
+        choices=["vector", "functional"],
+        default="vector",
+        help="parameter vectors, or torque profiles over gait phase",
+    )
+    parser.add_argument("--dim", type=int, default=1, help="parameter dimension")
     parser.add_argument("--n", type=int, default=2, help="number of configs")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -49,20 +25,54 @@ def main():
         action="store_true",
         help="prioritize the edges of the domain instead of Latin hypercube",
     )
+    # functional mode only
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=1,
+        help="basis points per profile; one support point is the usual seed",
+    )
+    parser.add_argument(
+        "--rho",
+        type=float,
+        default=None,
+        help="pin the lengthscale instead of adapting it (fixed-rho baseline)",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="read/write the experiment folder on this machine instead of the Pi",
+    )
     args = parser.parse_args()
 
-    if args.edges:
-        xs = edge_prioritized(args.dim, args.n, args.seed)
-        print(f"Sampling {args.n} edge-prioritized configs (dim={args.dim})...")
-    else:
-        xs = latin_hypercube(args.dim, args.n, args.seed)
-        print(f"Sampling {args.n} Latin hypercube configs (dim={args.dim})...")
+    if args.local:
+        experiment_io.use_local_storage()
+        os.makedirs(args.exp_dir, exist_ok=True)
 
+    kind = "edge-prioritized" if args.edges else "Latin hypercube"
     start = experiment_io.next_index(args.exp_dir)
-    for offset, x in enumerate(xs):
-        i = start + offset
-        experiment_io.save_config(args.exp_dir, i, x)
-        print(f"  wrote config_{i}.txt: {x}")
+
+    if args.mode == "functional":
+        print(f"Sampling {args.n} {kind} profiles (k={args.k})...")
+        fs = strategy.initial_functions(
+            k=args.k,
+            n=args.n,
+            seed=args.seed,
+            edges=args.edges,
+            rho=None if args.rho is None else jnp.full(1, args.rho),
+        )
+        for offset, f in enumerate(fs):
+            i = start + offset
+            experiment_io.save_config_function(args.exp_dir, i, f)
+            print(f"  wrote config_{i}.json: basis phases {f.x.squeeze(-1)}")
+    else:
+        print(f"Sampling {args.n} {kind} configs (dim={args.dim})...")
+        sampler = designs.edge_prioritized if args.edges else designs.latin_hypercube
+        xs = sampler(args.dim, args.n, args.seed, domain=designs.VECTOR_DOMAIN)
+        for offset, x in enumerate(xs):
+            i = start + offset
+            experiment_io.save_config(args.exp_dir, i, x)
+            print(f"  wrote config_{i}.txt: {x}")
 
     print(f"Done. {args.n} configs written to {args.exp_dir}")
 
