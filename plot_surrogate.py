@@ -1,5 +1,3 @@
-"""Plot a heatmap of the surrogate model mean over the domain, with the explored
-points overlaid, and save it to a self-contained HTML file (plotly)."""
 
 import argparse
 import os
@@ -21,11 +19,6 @@ def surrogate_mean_grid(
     anchor: Float[Array, "d"],
     resolution: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Evaluate the surrogate posterior mean over a 2D slice of the domain.
-
-    The two axes in ``dims`` sweep the search domain; every other dimension is
-    held fixed at ``anchor`` (typically the incumbent best config).
-    """
     d0, d1 = dims
     g = jnp.linspace(*designs.VECTOR_DOMAIN, resolution)
     gx, gy = jnp.meshgrid(g, g)
@@ -77,7 +70,6 @@ def plot(
         )
     )
 
-    # explored points sit at their observed objective, colored by that value
     fig.add_trace(
         go.Scatter3d(
             x=np.asarray(xs[:, d0]),
@@ -98,7 +90,6 @@ def plot(
         )
     )
 
-    # incumbent best, a large diamond so identity does not rest on color alone
     fig.add_trace(
         go.Scatter3d(
             x=[float(xs[best, d0])],

@@ -1,4 +1,3 @@
-"""Propose the next config to run, from everything observed so far."""
 
 import argparse
 import os
@@ -21,7 +20,6 @@ def main():
         action="store_true",
         help="minimize the objective (default: maximize)",
     )
-    # functional experiments only (detected from the folder, not passed in)
     parser.add_argument(
         "--k", type=int, default=4, help="number of adaptive basis points"
     )
@@ -46,7 +44,6 @@ def main():
         print(f"Loaded {n} observations, best so far: {ys.min():.6f}")
         print("Fitting surrogate and optimizing expected improvement...")
 
-    # what to optimize is decided by whatever the history already holds
     mode = experiment_io.experiment_mode(args.exp_dir)
     if mode is None:
         raise SystemExit(
@@ -82,7 +79,9 @@ def main():
             acquisition_max_restarts=args.max_restarts,
         )
         experiment_io.save_config(args.exp_dir, i, x_next)
-        print(f"Proposed next point -> config_{i}.txt: {x_next}")
+        print(f"Proposed next profile -> config_{i}.json (sine)")
+        print(f"  amplitude: {float(x_next[0]):.4f}")
+        print(f"  phase:     {float(x_next[1]):.4f}")
 
 
 if __name__ == "__main__":

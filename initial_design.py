@@ -1,11 +1,10 @@
-"""Write an initial space-filling design of configs into an experiment folder."""
 
 import argparse
 import os
 
 import jax.numpy as jnp
 
-from src import designs, experiment_io, strategy
+from src import designs, experiment_io, sine, strategy
 
 
 def main():
@@ -15,9 +14,8 @@ def main():
         "--mode",
         choices=["vector", "functional"],
         default="vector",
-        help="parameter vectors, or torque profiles over gait phase",
+        help="sine amplitude and phase, or a free-form torque profile",
     )
-    parser.add_argument("--dim", type=int, default=1, help="parameter dimension")
     parser.add_argument("--n", type=int, default=2, help="number of configs")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -25,7 +23,6 @@ def main():
         action="store_true",
         help="prioritize the edges of the domain instead of Latin hypercube",
     )
-    # functional mode only
     parser.add_argument(
         "--k",
         type=int,
@@ -66,13 +63,13 @@ def main():
             experiment_io.save_config_function(args.exp_dir, i, f)
             print(f"  wrote config_{i}.json: basis phases {f.x.squeeze(-1)}")
     else:
-        print(f"Sampling {args.n} {kind} configs (dim={args.dim})...")
+        print(f"Sampling {args.n} {kind} sine profiles {sine.PARAM_NAMES}...")
         sampler = designs.edge_prioritized if args.edges else designs.latin_hypercube
-        xs = sampler(args.dim, args.n, args.seed, domain=designs.VECTOR_DOMAIN)
+        xs = sampler(sine.DIM, args.n, args.seed, domain=designs.VECTOR_DOMAIN)
         for offset, x in enumerate(xs):
             i = start + offset
             experiment_io.save_config(args.exp_dir, i, x)
-            print(f"  wrote config_{i}.txt: {x}")
+            print(f"  wrote config_{i}.json: amplitude {x[0]:.3f}, phase {x[1]:.3f}")
 
     print(f"Done. {args.n} configs written to {args.exp_dir}")
 

@@ -1,4 +1,3 @@
-"""Acquisition functions and the multi-restart strategy used to optimize them."""
 
 from typing import Callable
 
@@ -15,10 +14,8 @@ EPS = float(jnp.sqrt(jnp.finfo(float).eps))
 
 @jax.jit
 def log_expected_improvement(mu: Scalar, sigma: Scalar, y_best: Scalar) -> Scalar:
-    # numerically stable version following https://arxiv.org/pdf/2310.20708:
     z = (y_best - mu) / sigma
 
-    # use lax.cond to avoid propagating NaNs in the gradients
     branch1 = lambda: jnp.log(z * jsp.stats.norm.cdf(z) + jsp.stats.norm.pdf(z))
     branch2a = lambda: -2 * jnp.log(-z)
     branch2b = lambda: jax.nn.log1mexp(
@@ -46,14 +43,6 @@ def optimize_restarts(
     screening_loss: Callable[[Float[Array, "n p"]], Float[Array, "n"]] | None = None,
     domain: tuple[float, float] = (0.0, 1.0),
 ) -> Float[Array, "p"]:
-    """Screen candidates by loss, then run L-BFGS-B from the best few.
-
-    ``acquisition_loss`` returns (value, gradient) and is minimized over
-    ``domain`` in every coordinate. ``screening_loss`` is an optional batched,
-    value-only version used for the screening pass, which is the bulk of the
-    candidate evaluations. Returns the location of the best local optimum found.
-    """
-    # only keep the best initial candidates
     if screening_loss is not None:
         losses = screening_loss(candidates)
     else:

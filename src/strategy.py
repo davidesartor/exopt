@@ -1,17 +1,3 @@
-"""Acquisition strategies: what to try next, given what has been observed.
-
-Two modes share the same GP + log-EI machinery:
-
-``propose_next``
-    Classic BO over a fixed-dimension parameter vector in the unit cube.
-
-``propose_next_functional``
-    BO over torque profiles, represented as sparse RKHS functions. The
-    acquisition optimizes the k basis locations, their values, *and* the
-    candidate's own lengthscale rho jointly, so both where the profile needs
-    resolution and how smooth it should be are chosen by the search rather than
-    fixed up front.
-"""
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +16,6 @@ def propose_next(
     acquisition_max_restarts: int = 5,
     domain: tuple[float, float] = designs.VECTOR_DOMAIN,
 ) -> tuple[Float[Array, "d"], gp.GaussianProcess]:
-    """Maximize log-EI over ``domain``, from a Latin hypercube of restarts."""
     dim = xs.shape[-1]
     surrogate_model = gp.GaussianProcess().fit(xs, ys)
 
@@ -65,24 +50,11 @@ def propose_next_functional(
     acquisition_max_restarts: int = 5,
     rho: Float[Array, "d"] | None = None,
 ) -> tuple[rkhs.Function, gp.FunctionalGaussianProcess]:
-    """Maximize log-EI over sparse RKHS functions with an adaptive lengthscale.
-
-    The search variable is a flat vector in [0,1]^(k*(d+1)+d): per basis point,
-    d coordinates plus one value, then d trailing entries for the candidate's
-    own lengthscale rho (searched in log scale over ``rkhs.RHO_RANGE``). So the
-    smoothness of the profile is chosen by the acquisition rather than fixed up
-    front and swept offline.
-
-    Passing ``rho`` pins the lengthscale instead of searching it, dropping the
-    trailing d entries -- the fixed-lengthscale baseline this method is meant to
-    improve on.
-    """
     ambient = rkhs.ambient_space(d)
     surrogate_model = gp.FunctionalGaussianProcess(ambient=ambient).fit(fs, ys)
     dim = k * (d + 1) + d if rho is None else k * (d + 1)
 
     def decode(p: Float[Array, "dim"]) -> rkhs.Function:
-        # from_array only reshapes for itself when it has to peel rho off first
         if rho is None:
             return rkhs.Function.from_array(None, p, d=d, y_range=y_range)
         return rkhs.Function.from_array(rho, p.reshape(k, d + 1), y_range=y_range)
@@ -97,7 +69,6 @@ def propose_next_functional(
             y_best=surrogate_model.observed_ys.min(),
         )
 
-    # value only, so the log-EI branches never need to stay gradient-safe
     @jax.jit
     def screening_loss(ps: Float[Array, "n k*(d+1)+d"]) -> Float[Array, "n"]:
         mu, cov = surrogate_model.predict_marginals(jax.vmap(decode)(ps))
@@ -126,11 +97,6 @@ def initial_functions(
     edges: bool = False,
     rho: Float[Array, "d"] | None = None,
 ) -> list[rkhs.Function]:
-    """Initial design in function space: space-filling over (x, y) and rho.
-
-    Passing ``rho`` pins the lengthscale, matching the fixed-lengthscale
-    baseline so both start from designs of the same size.
-    """
     sampler = designs.edge_prioritized if edges else designs.latin_hypercube
     dim = k * (d + 1) + d if rho is None else k * (d + 1)
     ps = sampler(dim, n, seed)

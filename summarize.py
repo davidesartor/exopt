@@ -1,14 +1,3 @@
-"""Aggregate a set of experiment folders into one CSV.
-
-Every run folder is self-describing -- the configs carry the profiles and the
-runs carry the traces -- so a sweep can be summarized after the fact from the
-folders alone, without having captured anything while it ran.
-
-    uv run summarize.py --root results/sweep --out results/summary.csv
-
-Folder names are taken as the run label. A trailing ``_s{seed}`` is split off
-into its own column, so ``adaptive_s3`` becomes label ``adaptive``, seed 3.
-"""
 
 import argparse
 import os
@@ -17,11 +6,10 @@ import re
 import jax.numpy as jnp
 import pandas as pd
 
-from src import experiment_io
+from src import experiment_io, sine
 
 
 def summarize_run(exp_dir: str) -> dict:
-    """One row per run: the objective trace reduced to its headline numbers."""
     mode = experiment_io.experiment_mode(exp_dir)
     if mode == "functional":
         fs, ys = experiment_io.load_functional_dataset(exp_dir)
@@ -31,7 +19,12 @@ def summarize_run(exp_dir: str) -> dict:
         )
     else:
         xs, ys = experiment_io.load_dataset(exp_dir)
-        extra = dict(k_final=int(xs.shape[-1]), rho_best=float("nan"))
+        best_x = xs[int(jnp.argmin(ys))]
+        extra = dict(
+            k_final=float("nan"),
+            rho_best=float("nan"),
+            **{f"{n}_best": float(v) for n, v in zip(sine.PARAM_NAMES, best_x)},
+        )
 
     return dict(
         mode=mode,
@@ -58,12 +51,13 @@ def main():
         experiment_io.use_local_storage()
 
     rows = []
-    for name in sorted(os.listdir(args.root)):
-        exp_dir = os.path.join(args.root, name)
-        if not os.path.isdir(exp_dir):
+    for name, exp_dir in experiment_io.subdirectories(args.root):
+        try:
+            if experiment_io.experiment_mode(exp_dir) is None:
+                continue
+        except ValueError as e:
+            print(f"Skipping {name}: {e}")
             continue
-        if experiment_io.experiment_mode(exp_dir) is None:
-            continue  # no configs: not a run folder
 
         m = re.match(r"(.+)_s(\d+)$", name)
         label, seed = (m.group(1), int(m.group(2))) if m else (name, -1)

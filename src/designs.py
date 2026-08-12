@@ -1,17 +1,3 @@
-"""Space-filling initial designs over a box domain.
-
-Samplers draw on the unit cube and are mapped onto ``domain`` at the end.
-Two domains are in play, and they are not the same thing:
-
-``VECTOR_DOMAIN``
-    The search domain of a plain parameter vector -- what a config *is*. Now
-    symmetric about zero.
-
-``UNIT``
-    The internal encoding of a functional candidate, which ``rkhs.Function``
-    decodes into basis locations, values, and a lengthscale, each with its own
-    range. That encoding is [0,1] by construction and is not a domain choice.
-"""
 
 import itertools
 
@@ -27,7 +13,6 @@ VECTOR_DOMAIN = (-1.0, 1.0)
 def rescale(
     u: Float[Array, "n d"], domain: tuple[float, float]
 ) -> Float[Array, "n d"]:
-    """Map samples from the unit cube onto ``domain``."""
     return u * (domain[1] - domain[0]) + domain[0]
 
 
@@ -45,15 +30,6 @@ def edge_prioritized(
     concentration: float = 0.5,
     domain: tuple[float, float] = UNIT,
 ) -> Float[Array, "n d"]:
-    """Space-filling samples warped toward the domain edges.
-
-    Starts with the literal corners of the domain (its 2^d vertices), in a
-    seed-shuffled order so no corner is systematically favored when n < 2^d,
-    and the extremes are always evaluated first. Any remaining slots are filled
-    from a Latin hypercube pushed toward the faces via the Beta(a, a) inverse
-    CDF with a = concentration < 1, which is U-shaped and piles probability
-    mass at the boundary.
-    """
     corners = jnp.array(list(itertools.product([0.0, 1.0], repeat=dim)))
     order = np.random.default_rng(seed).permutation(corners.shape[0])
     corners = corners[order]
