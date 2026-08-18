@@ -38,3 +38,4 @@ htmlcov/
 # parent directory is excluded, so "results/" would make the negation dead.
 results/*
 !results/*.csv
+experiments/

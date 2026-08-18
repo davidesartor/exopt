@@ -78,36 +78,25 @@ dt = 0.01
 with open(os.path.join(EXP_DIR, f'config_{RUN_NUMBER}.json')) as f:
     cfg = json.load(f)
 
-MODE = cfg.get("mode")
+H = cfg["harmonics"]
+amps = cfg["amplitudes"]
+phases = cfg["phases"]
+print(f"fourier profile: {len(amps)} atoms, {H} harmonics")
 
-if MODE == "vector":
-    AMPLITUDE = cfg["amplitude"] * TORQUE_SCALE
-    PHASE = cfg["phase"] * 2 * math.pi
-    print(f"sine profile: amplitude {AMPLITUDE:.4f} Nm, phase {PHASE:.4f} rad")
+def profile(v):
+    return sum(
+        a * sum(m ** -2.0 * math.cos(2 * math.pi * m * (v - p))
+                for m in range(1, H + 1))
+        for a, p in zip(amps, phases)
+    )
 
-    def torque(u):
-        return AMPLITUDE * math.sin(u - PHASE)
+PEAK = max(abs(profile(j / 20000.0)) for j in range(20001))
+if PEAK < 1e-9:
+    sys.exit(f"config {RUN_NUMBER} is flat, nothing to apply")
+print(f"peak |profile| {PEAK:.4f} -> scaled to +-{TORQUE_SCALE} Nm")
 
-elif MODE == "functional":
-    rho = cfg["rho"][0]
-    basis = [p[0] for p in cfg["x"]]
-    coeffs = cfg["a"]
-    print(f"rkhs profile: rho {rho}, basis {basis}, coeffs {coeffs}")
-
-    def profile(v):
-        return sum(a * math.exp(-0.5 * ((v - x) / rho) ** 2)
-                   for x, a in zip(basis, coeffs))
-
-    PEAK = max(abs(profile(j / 20000.0)) for j in range(20001))
-    if PEAK < 1e-9:
-        sys.exit(f"config {RUN_NUMBER} is flat, nothing to apply")
-    print(f"peak |profile| {PEAK:.4f} -> scaled to +-{TORQUE_SCALE} Nm")
-
-    def torque(u):
-        return TORQUE_SCALE * profile((u / (2 * math.pi)) % 1.0) / PEAK
-
-else:
-    sys.exit(f"config {RUN_NUMBER} has mode {MODE!r}; expected 'vector' or 'functional'")
+def torque(u):
+    return TORQUE_SCALE * profile((u / (2 * math.pi)) % 1.0) / PEAK
 
 
 VELOCITY_SCALE = dt

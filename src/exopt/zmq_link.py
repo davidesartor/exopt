@@ -1,0 +1,85 @@
+"""Driver <-> controller exchange: ZMQ pub/sub link and payload encoding."""
+
+from typing import cast
+
+import jax.numpy as jnp
+import zmq
+
+from exopt import rkhs_functions
+from exopt.rkhs_functions import Profile
+
+SAMPLE_PORT = 5555
+PROFILE_PORT = 5556
+
+
+def controller_link(
+    sample_port: int = SAMPLE_PORT, profile_port: int = PROFILE_PORT
+) -> tuple[zmq.Socket, zmq.Socket]:
+    """Controller side: bind a PUB for samples out and a SUB for profile updates in."""
+    ctx = zmq.Context.instance()
+    samples = ctx.socket(zmq.PUB)
+    samples.bind(f"tcp://*:{sample_port}")
+    profiles = ctx.socket(zmq.SUB)
+    profiles.bind(f"tcp://*:{profile_port}")
+    profiles.setsockopt_string(zmq.SUBSCRIBE, "")
+    return samples, profiles
+
+
+def driver_link(
+    host: str = "localhost",
+    sample_port: int = SAMPLE_PORT,
+    profile_port: int = PROFILE_PORT,
+) -> tuple[zmq.Socket, zmq.Socket]:
+    """BO side: connect a SUB for samples in and a PUB for profiles out.
+
+    With a remote host, reach it through an ssh tunnel:
+    ssh -N -L 5555:localhost:5555 -L 5556:localhost:5556 user@host
+    """
+    ctx = zmq.Context.instance()
+    samples = ctx.socket(zmq.SUB)
+    samples.connect(f"tcp://{host}:{sample_port}")
+    samples.setsockopt_string(zmq.SUBSCRIBE, "")
+    profiles = ctx.socket(zmq.PUB)
+    profiles.connect(f"tcp://{host}:{profile_port}")
+    return samples, profiles
+
+
+def latest_torque_profile(profiles: zmq.Socket) -> dict | None:
+    """Drain the profile socket, returning the newest update if any."""
+    newest = None
+    while profiles.poll(0):
+        newest = cast(dict, profiles.recv_json())
+    return newest
+
+
+def collect_segment(
+    samples: zmq.Socket, profiles: zmq.Socket, payload: dict, n: int, warmup: int
+) -> list[dict]:
+    """Publish the profile and gather its samples, dropping the first warmup."""
+    profiles.send_json(payload)
+    collected = []
+    while len(collected) < warmup + n:
+        # republish until the controller confirms the swap (slow-joiner losses)
+        if not samples.poll(1000):
+            profiles.send_json(payload)
+            continue
+        sample = cast(dict, samples.recv_json())
+        if sample["profile_id"] == payload["id"]:
+            collected.append(sample)
+    return collected[warmup:]
+
+
+def profile_payload(amplitude, phase, harmonics: int) -> dict:
+    return dict(
+        harmonics=harmonics,
+        amplitudes=[float(a) for a in amplitude],
+        phases=[float(p) for p in phase],
+    )
+
+
+def config_torque_profile(payload: dict) -> Profile:
+    return rkhs_functions.from_atoms(
+        jnp.asarray(payload["amplitudes"]),
+        jnp.asarray(payload["phases"]),
+        payload["harmonics"],
+    )
