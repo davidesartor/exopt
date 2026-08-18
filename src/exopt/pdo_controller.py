@@ -10,7 +10,7 @@ from tqdm import tqdm
 from exopt import zmq_link
 
 # control parameters
-EXPERIMENT_TIME = 60.0  # [s] maximum time to run the experiment
+EXPERIMENT_TIME = 30 * 60.0  # [s] maximum time to run the experiment
 MIN_CALIBRATION_TIME = 5.0  # [s] minimum time to calibrate the gait period
 CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
 SAMPLING_RATE = 100.0  # [Hz] control loop frequency
@@ -58,8 +58,11 @@ def apply_torques(candle: pyCandle.Candle, torque: Float[Array, "2"]) -> None:
 
 if __name__ == "__main__":
     # set up ZMQ sockets for streaming samples and receiving profiles
+    print("Setting up ZMQ link...")
     samples, profiles = zmq_link.controller_link()
+    print("ZMQ link ready. Setting up motors...")
     candle = setup_motors()
+    print("Motors ready.")
 
     # zero the position with the subject standing still
     input("Subject standing still: press enter to zero the position")

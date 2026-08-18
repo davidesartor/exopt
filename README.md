@@ -30,14 +30,15 @@ uv run mock-stream --target Branin
 ssh -N -L 5555:localhost:5555 -L 5556:localhost:5556 user@host &
 
 # locally: seed, then segment-collect / fit / propose / publish, in a loop
-uv run bo-loop --exp-dir <dir> --iterations 10 --samples 40 --warmup 10
+uv run bo-loop --exp-dir <dir> --duration 30 --warmup 10
 ```
 
-Each segment is `--samples` samples under one profile, with the first
-`--warmup` dropped after a swap. Segments are recorded to `--exp-dir` as
-`config_i.json` / `run_i.txt` pairs, so `bo-loop` resumes an interrupted
-session, and `--mode functional` continues a vector one. `bo-loop` maximizes
-by default (`--minimize` to flip) and `--iterations 1` is a single BO step.
+Each segment runs one profile until its mean converges (`--tol`, capped at
+`--max-samples`), with the first `--warmup` samples dropped after a swap.
+Segments are recorded to `--exp-dir` as `config_i.json` / `run_i.txt` pairs,
+so `bo-loop` resumes an interrupted session, and `--mode functional` continues
+a vector one. `bo-loop` maximizes by default (`--minimize` to flip) and keeps
+proposing until `--duration` minutes of experiment time elapse.
 
 The real controller needs only a non-blocking `poll()` of the profile socket
 in its main loop and a `profile_id` tag on each streamed sample (see

@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import time
 from functools import partial
 
 import jax
@@ -149,7 +150,7 @@ def main():
         help="folder recording the session",
     )
     parser.add_argument(
-        "--iterations", type=int, default=10, help="total segments to run"
+        "--duration", type=float, default=30.0, help="total experiment time in minutes"
     )
     parser.add_argument(
         "--warmup", type=int, default=100, help="samples dropped after a swap"
@@ -193,13 +194,14 @@ def main():
         print(f"Empty folder: seeding a {args.n}-point Latin hypercube design.")
         seed_folder(args)
 
+    deadline = time.monotonic() + 60.0 * args.duration
     while True:
         # split the folder into completed and still-pending configs
         configs = experiment_io.config_numbers(args.exp_dir)
         done = configs & experiment_io.run_numbers(args.exp_dir)
         pending = sorted(configs - done)
         if not pending:
-            if len(done) >= args.iterations:
+            if time.monotonic() >= deadline:
                 break
             key, subkey = jr.split(key)
             propose(args, subkey)
@@ -211,7 +213,7 @@ def main():
         profiles.send_json(payload)
 
         # while the controller runs it, extend the queue against fantasized outcomes
-        if len(done) >= 2 and len(configs) < args.iterations:
+        if len(done) >= 2 and time.monotonic() < deadline:
             key, subkey = jr.split(key)
             propose(args, subkey)
 
@@ -231,7 +233,7 @@ def main():
             f"{experiment_io.read_result(args.exp_dir, i):.6f}"
         )
 
-    print(f"Done: {args.iterations} segments in {args.exp_dir}.")
+    print(f"Done: {len(done)} segments in {args.exp_dir}.")
 
 
 if __name__ == "__main__":
