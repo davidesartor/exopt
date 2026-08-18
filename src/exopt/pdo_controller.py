@@ -11,7 +11,8 @@ from exopt import zmq_link
 
 # control parameters
 EXPERIMENT_TIME = 60.0  # [s] maximum time to run the experiment
-CALIBRATION_TIME = 5.0  # [s] time to calibrate the gait period
+MIN_CALIBRATION_TIME = 5.0  # [s] minimum time to calibrate the gait period
+CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
 SAMPLING_RATE = 100.0  # [Hz] control loop frequency
 SAMPLING_STEP = 1.0 / SAMPLING_RATE  # [s] control loop period
 TORQUE_SCALE = 5.0  # [Nm] scale factor for the torque
@@ -21,19 +22,23 @@ GAIN_RAMP_TIME = 5.0  # [s] ramp assistance from 0 to full after a profile swap
 
 
 def setup_motors() -> pyCandle.Candle:
-    """Connect over CAN, zero encoders, and enable both motors in raw torque mode."""
+    """Connect over CAN and register both motors."""
     candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
     ids = candle.ping()
     if len(ids) < 2:
         sys.exit(f"expected 2 motors, found {len(ids)}")
     for id in ids[:2]:
         candle.addMd80(id)
-        candle.controlMd80SetEncoderZero(id)
-        candle.controlMd80Mode(id, pyCandle.RAW_TORQUE)
-        candle.controlMd80Enable(id, True)
-    for md in candle.md80s:
-        md.setMaxTorque(MAX_TORQUE)
     return candle
+
+
+def zero_and_enable(candle: pyCandle.Candle) -> None:
+    """Zero encoders at the current pose and enable raw torque mode."""
+    for md in candle.md80s:
+        candle.controlMd80SetEncoderZero(md.getId())
+        candle.controlMd80Mode(md.getId(), pyCandle.RAW_TORQUE)
+        candle.controlMd80Enable(md.getId(), True)
+        md.setMaxTorque(MAX_TORQUE)
 
 
 def read_legs_state(
@@ -55,26 +60,45 @@ if __name__ == "__main__":
     # set up ZMQ sockets for streaming samples and receiving profiles
     samples, profiles = zmq_link.controller_link()
     candle = setup_motors()
+
+    # zero the position with the subject standing still
+    input("Subject standing still: press enter to zero the position")
+    zero_and_enable(candle)
     candle.begin()
-    input("Press enter to start")
+
+    input("Press enter to start walking")
     start = time.monotonic()
 
     try:
-        # estimate the stride frequency (omega^2 = <velocity^2>/<position^2>)
-        with tqdm(
-            total=CALIBRATION_TIME, desc="calibrating gait period", unit="s"
-        ) as pbar:
+        # estimate the stride frequency (omega^2 = <velocity^2>/<position^2>) until stable
+        with tqdm(desc="calibrating gait period", unit="s") as pbar:
             mean_sq_position, mean_sq_velocity = 0.0, 0.0
-            gait_omega = None
-            while (now := time.monotonic()) - start < CALIBRATION_TIME:
+            gait_omega, checked_omega, checked_at = None, None, start
+            while True:
                 # accumulate mean squared position and velocity over both legs
                 position, velocity = read_legs_state(candle)
                 mean_sq_position += float(jnp.sum(position**2))
                 mean_sq_velocity += float(jnp.sum(velocity**2))
                 gait_omega = jnp.sqrt(mean_sq_velocity / mean_sq_position)
 
+                # once per second, stop if the estimate drifted less than the tolerance
+                now = time.monotonic()
+                if now - checked_at >= 1.0:
+                    drift = (
+                        None
+                        if checked_omega is None
+                        else abs(gait_omega - checked_omega) / gait_omega
+                    )
+                    checked_omega, checked_at = gait_omega, now
+                    if (
+                        now - start >= MIN_CALIBRATION_TIME
+                        and drift is not None
+                        and drift < CALIBRATION_TOL
+                    ):
+                        break
+
                 # control loop step
-                pbar.n = now - start
+                pbar.n = round(now - start, 1)
                 pbar.set_postfix(ω=f"{float(gait_omega):.4f} rad/s")
                 time.sleep(SAMPLING_STEP)
 

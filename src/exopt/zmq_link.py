@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import zmq
 
 from typing import cast
-from exopt import acquisition, rkhs_functions
+from exopt import rkhs_functions
 
 # link parameters
 SAMPLE_PORT = 5555  # controller PUB -> driver SUB, one JSON dict per control step
@@ -65,6 +65,8 @@ def collect_segment(
     Stops when the standard error of the mean penalized power falls below
     tol * max(|mean|, 1), bounded by min_samples and max_samples.
     """
+    from exopt import acquisition  # driver-side only; keeps vlse off the controller
+
     profiles.send_json(payload)
     collected = []
     mean, m2 = 0.0, 0.0
