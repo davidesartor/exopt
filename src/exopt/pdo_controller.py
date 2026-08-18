@@ -34,9 +34,10 @@ if __name__ == "__main__":
         sys.exit(f"expected 2 motors, found {len(ids)}")
     for id in ids[:2]:
         candle.addMd80(id)
-    for id, md in zip(ids, candle.md80s):
+    for id in ids[:2]:
         if not candle.controlMd80SetEncoderZero(id):
             sys.exit(f"failed to zero encoder on drive {id}")
+    for id, md in zip(ids, candle.md80s):
         if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE):
             sys.exit(f"failed to set mode on drive {id}")
         if not candle.controlMd80Enable(id, True):
