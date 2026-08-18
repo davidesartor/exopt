@@ -92,6 +92,17 @@ def optimize_restarts(
     return jax.tree.map(lambda a: a[winner], results.x)
 
 
+def sample_power(sample: dict, beta: float = 5.0) -> float:
+    """Penalized assistance power of one control-loop sample, averaged over legs."""
+    power = np.array(
+        [
+            sample["torque_0"] * sample["velocity_0"],
+            sample["torque_1"] * sample["velocity_1"],
+        ]
+    )
+    return float(np.mean(np.where(power < 0, beta * power, power)))
+
+
 def objective(trace: np.ndarray, beta: float = 5.0) -> float:
     """Mean assistance power over a trace, penalizing negative power by beta."""
     power0 = trace["torque_0"] * trace["velocity_0"]

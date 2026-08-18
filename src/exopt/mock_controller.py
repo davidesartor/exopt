@@ -30,7 +30,7 @@ def simulate_legs_state(t: float) -> tuple[Float[Array, "2"], Float[Array, "2"]]
     def gait_profile(t: float) -> Float[Array, "2"]:
         # the gait phase for each leg, offset by half a gait cycle
         phase0 = (t % TRUE_GAIT_PERIOD) / TRUE_GAIT_PERIOD
-        phase1 = 1 - phase0
+        phase1 = (phase0 + 0.5) % 1.0
         phase = jnp.array([phase0, phase1])[:, None]
 
         # make a periodic gait trajectory from the low-fidelity Forrester model

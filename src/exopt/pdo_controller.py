@@ -1,202 +1,139 @@
-import pyCandle
-from time import sleep, time
-import math
-import glob
-import json
-import os
-import re
+"""Hardware controller: drive the exo motors over pyCandle and stream samples over ZMQ."""
+
 import sys
-import numpy as np
+import time
+import pyCandle
+import jax.numpy as jnp
 
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-EXP_DIR = args[0] if args else os.path.dirname(os.path.abspath(__file__))
-RERUN = "--rerun" in sys.argv
+from jaxtyping import Array, Float
+from tqdm import tqdm
+from exopt import zmq_link
 
-config_numbers = [
-    int(re.search(r"config_(\d+)\.json$", p).group(1))
-    for p in glob.glob(os.path.join(EXP_DIR, "config_*.json"))
-]
-if not config_numbers:
-    sys.exit(f"No config_*.json in {EXP_DIR}")
-
-
-def run_file(i):
-    return os.path.join(EXP_DIR, f"run_{i}.txt")
-
-
-pending = sorted(i for i in config_numbers if not os.path.exists(run_file(i)))
-
-if RERUN:
-    RUN_NUMBER = max(config_numbers)
-    answer = input(f"Re-run config {RUN_NUMBER}, appending to its run file? [y/N] ")
-    if answer.strip().lower() != "y":
-        sys.exit("EXIT: nothing written")
-elif not pending:
-    sys.exit(
-        f"Every config in {EXP_DIR} has been run already. "
-        "Propose the next one with bo_step.py, or pass --rerun to repeat the newest."
-    )
-else:
-    RUN_NUMBER = pending[0]
-    if len(pending) > 1:
-        print(f"{len(pending)} configs still to run: {pending}")
-
-run_path = run_file(RUN_NUMBER)
-
-print(f"Experiment folder: {EXP_DIR}")
-print(f"Running config {RUN_NUMBER}")
-
-TORQUE_SCALE = 5.0
-
-candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
-
-ids = candle.ping()
-
-if len(ids) == 0:
-    sys.exit("EXIT FALIURE")
-
-for id in ids:
-    candle.addMd80(id)
-
-candle.controlMd80SetEncoderZero(ids[0])
-candle.controlMd80Mode(ids[0], pyCandle.RAW_TORQUE)
-candle.controlMd80Enable(ids[0], True)
-
-candle.controlMd80SetEncoderZero(ids[1])
-candle.controlMd80Mode(ids[1], pyCandle.RAW_TORQUE)
-candle.controlMd80Enable(ids[1], True)
-
-candle.md80s[0].setMaxTorque(13)
-candle.md80s[1].setMaxTorque(13)
+# control parameters
+EXPERIMENT_TIME = 60.0  # [s] maximum time to run the experiment
+CALIBRATION_TIME = 5.0  # [s] time to calibrate the gait period
+SAMPLING_RATE = 100.0  # [Hz] control loop frequency
+SAMPLING_STEP = 1.0 / SAMPLING_RATE  # [s] control loop period
+TORQUE_SCALE = 5.0  # [Nm] scale factor for the torque
+LOWPASS_SMOOTHING = 0.5  # EMA weight before the phase-estimation
+MAX_TORQUE = 13.0  # [Nm] hardware torque limit per motor
+GAIN_RAMP_TIME = 5.0  # [s] ramp assistance from 0 to full after a profile swap
 
 
-times = []
-
-end_time = 60
-dt = 0.01
-
-with open(os.path.join(EXP_DIR, f'config_{RUN_NUMBER}.json')) as f:
-    cfg = json.load(f)
-
-sin_coeffs = cfg["sin"]
-cos_coeffs = cfg["cos"]
-H = len(sin_coeffs)
-print(f"fourier profile: {H} harmonics")
-
-def profile(v):
-    return sum(
-        s * math.sin(2 * math.pi * m * v) + c * math.cos(2 * math.pi * m * v)
-        for m, (s, c) in enumerate(zip(sin_coeffs, cos_coeffs), start=1)
-    )
-
-PEAK = max(abs(profile(j / 20000.0)) for j in range(20001))
-if PEAK < 1e-9:
-    sys.exit(f"config {RUN_NUMBER} is flat, nothing to apply")
-print(f"peak |profile| {PEAK:.4f} -> scaled to +-{TORQUE_SCALE} Nm")
-
-def torque(u):
-    return TORQUE_SCALE * profile((u / (2 * math.pi)) % 1.0) / PEAK
+def setup_motors() -> pyCandle.Candle:
+    """Connect over CAN, zero encoders, and enable both motors in raw torque mode."""
+    candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
+    ids = candle.ping()
+    if len(ids) < 2:
+        sys.exit(f"expected 2 motors, found {len(ids)}")
+    for id in ids[:2]:
+        candle.addMd80(id)
+        candle.controlMd80SetEncoderZero(id)
+        candle.controlMd80Mode(id, pyCandle.RAW_TORQUE)
+        candle.controlMd80Enable(id, True)
+    for md in candle.md80s:
+        md.setMaxTorque(MAX_TORQUE)
+    return candle
 
 
-VELOCITY_SCALE = dt
-
-POSITION_OFFSET = [0.0, 0.0]
-
-
-def gait_phase(position, velocity, leg):
-    return math.atan2(velocity * VELOCITY_SCALE, position - POSITION_OFFSET[leg])
-
-
-alpha = 0.9
-gain_ramp = 1
-pos_prv = [0.0, 0.0]
-vel_prv = [0.0, 0.0]
-
-num_steps = int(end_time/dt)
-positions = np.zeros((num_steps, 2))
-velocities = np.zeros((num_steps, 2))
-gait_phases = np.zeros((num_steps, 2))
-torques  = np.zeros((num_steps, 2))
-actual_torques  = np.zeros((num_steps, 2))
-mechanicalPower = np.zeros((num_steps, 2))
-off_status = 0
-candle.begin()
-input("Press enter/any key to start")
-file1=open(run_path, "a+")
-file1.write("time position_0 position_1 velocity_0 velocity_1 gait_phase_0 gait_phase_1 torque_0 torque_1 actual_torque_0 actual_torque_1 mechanicalPower_0 mechanicalPower_1\n")
+def read_legs_state(
+    candle: pyCandle.Candle,
+) -> tuple[Float[Array, "2"], Float[Array, "2"]]:
+    """Leg positions [rad] and angular velocities [rad/s] from the encoders."""
+    position = jnp.array([md.getPosition() for md in candle.md80s])
+    velocity = jnp.array([md.getVelocity() for md in candle.md80s])
+    return position, velocity
 
 
-start_time = time()
-print('Test started')
-for i in range(num_steps):
+def apply_torques(candle: pyCandle.Candle, torque: Float[Array, "2"]) -> None:
+    """Send the target torque [Nm] to each motor."""
+    for md, tau in zip(candle.md80s, torque):
+        md.setTargetTorque(float(tau))
+
+
+if __name__ == "__main__":
+    # set up ZMQ sockets for streaming samples and receiving profiles
+    samples, profiles = zmq_link.controller_link()
+    candle = setup_motors()
+    candle.begin()
+    input("Press enter to start")
+    start = time.monotonic()
+
     try:
-        curr_time = time() - start_time
-        loop_start = time()
+        # estimate the stride frequency (omega^2 = <velocity^2>/<position^2>)
+        with tqdm(
+            total=CALIBRATION_TIME, desc="calibrating gait period", unit="s"
+        ) as pbar:
+            mean_sq_position, mean_sq_velocity = 0.0, 0.0
+            gait_omega = None
+            while (now := time.monotonic()) - start < CALIBRATION_TIME:
+                # accumulate mean squared position and velocity over both legs
+                position, velocity = read_legs_state(candle)
+                mean_sq_position += float(jnp.sum(position**2))
+                mean_sq_velocity += float(jnp.sum(velocity**2))
+                gait_omega = jnp.sqrt(mean_sq_velocity / mean_sq_position)
 
-        if curr_time > (end_time - 10):
-            if off_status == 0:
-                print('Exo will turn off in 10 seconds')
-                off_status = 1
-        if curr_time > end_time:
-            print('Stop the treadmill')
-            candle.md80s[0].setTargetTorque(0)
-            candle.md80s[1].setTargetTorque(0)
-            sleep(15)
-            file1.flush()
-            file1.close()
-            print('File saved')
-            break
+                # control loop step
+                pbar.n = now - start
+                pbar.set_postfix(ω=f"{float(gait_omega):.4f} rad/s")
+                time.sleep(SAMPLING_STEP)
 
+        # report the estimated gait period and angular velocity
+        assert gait_omega is not None, "failed to calibrate gait period"
+        gait_period = 2 * jnp.pi / gait_omega
+        print(f"ω = {float(gait_omega):.2f} rad/s")
+        print(f"τ = {float(gait_period):.4f} s")
 
-        times.append(curr_time)
+        # block until the first profile arrives
+        print(f"Waiting for a profile to stream samples...")
+        while (payload := zmq_link.latest_torque_profile(profiles)) is None:
+            time.sleep(SAMPLING_STEP)
+        torque_profile = zmq_link.config_torque_profile(payload)
+        smooth_position, smooth_velocity = read_legs_state(candle)
 
+        # run the experiment, streaming samples and updating the profile when a new one arrives
+        with tqdm(total=EXPERIMENT_TIME, desc=f"profile {payload['id']}", unit="s") as pbar:
+            while (now := time.monotonic()) - start < EXPERIMENT_TIME:
+                # update the profile if a new one has arrived
+                if (update := zmq_link.latest_torque_profile(profiles)) is not None:
+                    payload = update
+                    torque_profile = zmq_link.config_torque_profile(payload)
+                    pbar.set_description(f"profile {payload['id']}")
 
-        gain = min(curr_time/5, 1.0)
-        if gain >= 1.0 and gain_ramp == 1:
-            print('Gain ramped up')
-            gain_ramp = 0
+                # estimate the gait phase and compute the torque for each leg
+                position, velocity = read_legs_state(candle)
+                smooth_position += LOWPASS_SMOOTHING * (position - smooth_position)
+                smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
+                gait_phase = jnp.arctan2(smooth_velocity / gait_omega, smooth_position)
+                gain = min((now - start) / GAIN_RAMP_TIME, 1.0)
+                torque = gain * TORQUE_SCALE * torque_profile(gait_phase)
+                apply_torques(candle, torque)
 
+                # control loop step
+                time.sleep(SAMPLING_STEP)
+                pbar.n = now - start
+                actual_torque = jnp.array([md.getTorque() for md in candle.md80s])
+                power = actual_torque * velocity
+                pbar.set_postfix(power=f"{float(power.sum()):.3f}")
 
-        positions[i] = [candle.md80s[0].getPosition(), candle.md80s[1].getPosition()]
-        velocities[i] = [candle.md80s[0].getVelocity(), candle.md80s[1].getVelocity()]
-
-        pos_prv = [alpha*p + (1-alpha)*positions[i,j] for j, p in enumerate(pos_prv)]
-        vel_prv = [alpha*v + (1-alpha)*velocities[i,j] for j, v in enumerate(vel_prv)]
-
-        gait_phases[i] = [gait_phase(pos_prv[j], vel_prv[j], j) for j in (0, 1)]
-        torque_0 = gain*torque(gait_phases[i, 0])
-        torque_1 = gain*torque(gait_phases[i, 1])
-
-
-        torques[i] = [torque_0, torque_1]
-
-
-        candle.md80s[0].setTargetTorque(float(torque_0))
-        candle.md80s[1].setTargetTorque(float(torque_1))
-
-        actual_torques[i] = [candle.md80s[0].getTorque(), candle.md80s[1].getTorque()]
-
-        mechanicalPower[i,0] = actual_torques[i,0]*velocities[i,0]
-        mechanicalPower[i,1] = actual_torques[i,1]*velocities[i,1]
-
-
-        file1.write(str(times[i])+" "+str(positions[i, 0])+" "+str(positions[i, 1])+" "+str(velocities[i, 0])+" "+str(velocities[i, 1])+" "+str(gait_phases[i, 0])+" "+str(gait_phases[i, 1])+" "+str(torques[i, 0])+" "+str(torques[i, 1])+ " "+str(actual_torques[i, 0])+" "+str(actual_torques[i, 1])+" "+str(mechanicalPower[i, 0])+" "+str(mechanicalPower[i, 1])+"\n" )
-
-        loop_end = time()
-
-        if dt - (loop_end - loop_start) < 0:
-            print((loop_end - loop_start))
-        else:
-            sleep(dt - (loop_end - loop_start))
-    except KeyboardInterrupt:
-        candle.md80s[0].setTargetTorque(0.0)
-        candle.md80s[1].setTargetTorque(0.0)
-        sleep(60)
+                # send current timestep measurements back to the driver
+                samples.send_json(
+                    dict(
+                        profile_id=payload["id"],
+                        time=now - start,
+                        gait_phase0=float(gait_phase[0]),
+                        gait_phase1=float(gait_phase[1]),
+                        position_0=float(position[0]),
+                        position_1=float(position[1]),
+                        velocity_0=float(velocity[0]),
+                        velocity_1=float(velocity[1]),
+                        torque_0=float(torque[0]),
+                        torque_1=float(torque[1]),
+                        actual_torque_0=float(actual_torque[0]),
+                        actual_torque_1=float(actual_torque[1]),
+                    )
+                )
+    finally:
+        # always leave the motors unpowered
+        apply_torques(candle, jnp.zeros(2))
         candle.end()
-        sys.exit("EXIT SUCCESS")
-
-        file1.flush()
-        file1.close()
-        break
-candle.end()
-sys.exit("EXIT SUCCESS")

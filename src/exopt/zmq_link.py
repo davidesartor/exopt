@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import zmq
 
 from typing import cast
-from exopt import rkhs_functions
+from exopt import acquisition, rkhs_functions
 
 # link parameters
 SAMPLE_PORT = 5555  # controller PUB -> driver SUB, one JSON dict per control step
@@ -52,12 +52,23 @@ def latest_torque_profile(profiles: zmq.Socket) -> dict | None:
 
 
 def collect_segment(
-    samples: zmq.Socket, profiles: zmq.Socket, payload: dict, n: int, warmup: int
+    samples: zmq.Socket,
+    profiles: zmq.Socket,
+    payload: dict,
+    warmup: int,
+    tol: float = 0.05,
+    min_samples: int = 100,
+    max_samples: int = 2000,
 ) -> list[dict]:
-    """Publish the profile and gather its samples, dropping the first warmup."""
+    """Publish the profile and gather samples until the objective estimate converges.
+
+    Stops when the standard error of the mean penalized power falls below
+    tol * max(|mean|, 1), bounded by min_samples and max_samples.
+    """
     profiles.send_json(payload)
     collected = []
-    while len(collected) < warmup + n:
+    mean, m2 = 0.0, 0.0
+    while True:
         # republish until the controller confirms the swap (slow-joiner losses)
         if not samples.poll(1000):
             profiles.send_json(payload)
@@ -65,8 +76,26 @@ def collect_segment(
 
         # keep only samples tagged with the requested profile
         sample = cast(dict, samples.recv_json())
-        if sample["profile_id"] == payload["id"]:
-            collected.append(sample)
+        if sample["profile_id"] != payload["id"]:
+            continue
+        collected.append(sample)
+        n = len(collected) - warmup
+        if n < 1:
+            continue
+
+        # Welford update of the running objective estimate
+        x = acquisition.sample_power(sample)
+        delta = x - mean
+        mean += delta / n
+        m2 += delta * (x - mean)
+
+        # stop once the estimate is stable (or the budget is exhausted)
+        if n >= max_samples:
+            break
+        if n >= min_samples:
+            sem = (m2 / (n - 1) / n) ** 0.5
+            if sem < tol * max(abs(mean), 1.0):
+                break
     return collected[warmup:]
 
 

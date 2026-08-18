@@ -151,9 +151,20 @@ def main():
     parser.add_argument(
         "--iterations", type=int, default=10, help="total segments to run"
     )
-    parser.add_argument("--samples", type=int, default=1000, help="samples per segment")
     parser.add_argument(
         "--warmup", type=int, default=100, help="samples dropped after a swap"
+    )
+    parser.add_argument(
+        "--tol",
+        type=float,
+        default=0.05,
+        help="relative standard-error tolerance for segment convergence",
+    )
+    parser.add_argument(
+        "--min-samples", type=int, default=100, help="samples before checking convergence"
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=2000, help="per-segment sample budget"
     )
     parser.add_argument(
         "--mode",
@@ -206,7 +217,13 @@ def main():
 
         # gather the segment and record it next to its config
         collected = zmq_link.collect_segment(
-            samples, profiles, payload, args.samples, args.warmup
+            samples,
+            profiles,
+            payload,
+            args.warmup,
+            tol=args.tol,
+            min_samples=args.min_samples,
+            max_samples=args.max_samples,
         )
         experiment_io.write_run(args.exp_dir, i, collected)
         print(
