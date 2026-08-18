@@ -26,17 +26,14 @@ if __name__ == "__main__":
     samples, profiles = zmq_link.controller_link()
     print("ZMQ link ready. Setting up motors...")
 
-    # connect over CAN and register both motors
+    # connect over CAN with the subject standing still, zero and enable both motors
+    input("Subject standing still: press enter to zero the position")
     candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
     ids = candle.ping()
     if len(ids) < 2:
         sys.exit(f"expected 2 motors, found {len(ids)}")
     for id in ids[:2]:
         candle.addMd80(id)
-    print("Motors ready.")
-
-    # zero encoders with the subject standing still, then enable raw torque mode
-    input("Subject standing still: press enter to zero the position")
     for id, md in zip(ids, candle.md80s):
         if not candle.controlMd80SetEncoderZero(id):
             sys.exit(f"failed to zero encoder on drive {id}")
