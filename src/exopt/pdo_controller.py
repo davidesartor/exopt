@@ -66,14 +66,15 @@ if __name__ == "__main__":
                 position_offset += (position - position_offset) / n_samples
                 mean_sq_position += float(jnp.sum((position - position_offset) ** 2))
                 mean_sq_velocity += float(jnp.sum(velocity**2))
-                gait_omega = jnp.sqrt(mean_sq_velocity / mean_sq_position)
+                if mean_sq_position > 0.0:
+                    gait_omega = jnp.sqrt(mean_sq_velocity / mean_sq_position)
 
                 # once per second, stop if the estimate drifted less than the tolerance
                 now = time.monotonic()
                 if now - checked_at >= 1.0:
                     drift = (
                         None
-                        if checked_omega is None
+                        if checked_omega is None or gait_omega is None
                         else abs(gait_omega - checked_omega) / gait_omega
                     )
                     checked_omega, checked_at = gait_omega, now
@@ -86,7 +87,8 @@ if __name__ == "__main__":
 
                 # control loop step
                 pbar.n = round(now - start, 1)
-                pbar.set_postfix(ω=f"{float(gait_omega):.4f} rad/s")
+                if gait_omega is not None:
+                    pbar.set_postfix(ω=f"{float(gait_omega):.4f} rad/s")
                 time.sleep(SAMPLING_STEP)
 
         # report the estimated gait period and angular velocity
