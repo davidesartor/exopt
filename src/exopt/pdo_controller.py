@@ -38,11 +38,16 @@ if __name__ == "__main__":
     # zero encoders with the subject standing still, then enable raw torque mode
     input("Subject standing still: press enter to zero the position")
     for id, md in zip(ids, candle.md80s):
-        candle.controlMd80SetEncoderZero(id)
-        candle.controlMd80Mode(id, pyCandle.RAW_TORQUE)
-        candle.controlMd80Enable(id, True)
+        if not candle.controlMd80SetEncoderZero(id):
+            sys.exit(f"failed to zero encoder on drive {id}")
+        if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE):
+            sys.exit(f"failed to set mode on drive {id}")
+        if not candle.controlMd80Enable(id, True):
+            sys.exit(f"failed to enable drive {id}")
         md.setMaxTorque(MAX_TORQUE)
     candle.begin()
+    time.sleep(0.5)
+    print("positions after zeroing:", [md.getPosition() for md in candle.md80s])
 
     input("Press enter to start walking")
     start = time.monotonic()
