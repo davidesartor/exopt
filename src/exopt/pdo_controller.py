@@ -55,11 +55,16 @@ if __name__ == "__main__":
         with tqdm(desc="calibrating gait period", unit="s") as pbar:
             mean_sq_position, mean_sq_velocity = 0.0, 0.0
             gait_omega, checked_omega, checked_at = None, None, start
+            position_offset = jnp.array([md.getPosition() for md in candle.md80s])
+            n_samples = 0
             while True:
-                # accumulate mean squared position and velocity over both legs
+                # accumulate mean squared position and velocity over both legs,
+                # centering position on its running mean (the encoder zero is unreliable)
                 position = jnp.array([md.getPosition() for md in candle.md80s])
                 velocity = jnp.array([md.getVelocity() for md in candle.md80s])
-                mean_sq_position += float(jnp.sum(position**2))
+                n_samples += 1
+                position_offset += (position - position_offset) / n_samples
+                mean_sq_position += float(jnp.sum((position - position_offset) ** 2))
                 mean_sq_velocity += float(jnp.sum(velocity**2))
                 gait_omega = jnp.sqrt(mean_sq_velocity / mean_sq_position)
 
@@ -90,6 +95,9 @@ if __name__ == "__main__":
         print(f"ω = {float(gait_omega):.2f} rad/s")
         print(f"τ = {float(gait_period):.4f} s")
 
+        # slow EMA weight so the offset estimate has an effective sample size of one gait cycle
+        offset_smoothing = SAMPLING_STEP / float(gait_period)
+
         # block until the first profile arrives
         print(f"Waiting for a profile to stream samples...")
         while (payload := zmq_link.latest_torque_profile(profiles)) is None:
@@ -97,7 +105,9 @@ if __name__ == "__main__":
         torque_profile = zmq_link.config_torque_profile(payload)
         prev_torque_profile = lambda phase: jnp.zeros_like(phase)
         profile_swap_at = time.monotonic()
-        smooth_position = jnp.array([md.getPosition() for md in candle.md80s])
+        smooth_position = (
+            jnp.array([md.getPosition() for md in candle.md80s]) - position_offset
+        )
         smooth_velocity = jnp.array([md.getVelocity() for md in candle.md80s])
 
         # run the experiment, streaming samples and updating the profile when a new one arrives
@@ -116,7 +126,10 @@ if __name__ == "__main__":
                 # estimate the gait phase and compute the torque for each leg
                 position = jnp.array([md.getPosition() for md in candle.md80s])
                 velocity = jnp.array([md.getVelocity() for md in candle.md80s])
-                smooth_position += LOWPASS_SMOOTHING * (position - smooth_position)
+                position_offset += offset_smoothing * (position - position_offset)
+                smooth_position += LOWPASS_SMOOTHING * (
+                    position - position_offset - smooth_position
+                )
                 smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
                 gait_phase = jnp.arctan2(smooth_velocity / gait_omega, smooth_position)
                 # blend from the previous profile to the new one after a swap
