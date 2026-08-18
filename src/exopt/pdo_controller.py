@@ -78,16 +78,15 @@ dt = 0.01
 with open(os.path.join(EXP_DIR, f'config_{RUN_NUMBER}.json')) as f:
     cfg = json.load(f)
 
-H = cfg["harmonics"]
-amps = cfg["amplitudes"]
-phases = cfg["phases"]
-print(f"fourier profile: {len(amps)} atoms, {H} harmonics")
+sin_coeffs = cfg["sin"]
+cos_coeffs = cfg["cos"]
+H = len(sin_coeffs)
+print(f"fourier profile: {H} harmonics")
 
 def profile(v):
     return sum(
-        a * sum(m ** -2.0 * math.cos(2 * math.pi * m * (v - p))
-                for m in range(1, H + 1))
-        for a, p in zip(amps, phases)
+        s * math.sin(2 * math.pi * m * v) + c * math.cos(2 * math.pi * m * v)
+        for m, (s, c) in enumerate(zip(sin_coeffs, cos_coeffs), start=1)
     )
 
 PEAK = max(abs(profile(j / 20000.0)) for j in range(20001))

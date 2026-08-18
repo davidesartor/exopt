@@ -1,15 +1,26 @@
-"""Acquisition utilities: stable log-EI, start designs, restart optimization, loss."""
+"""Acquisition utilities: stable log-EI, start designs, restart optimization, objective."""
 
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import jax.scipy as jsp
 import numpy as np
 import vlse
-from jaxtyping import Array, Float, Scalar
 
-from exopt.rkhs_functions import EPS
+from jaxtyping import Array, Float, Key, PyTree, Scalar
+from exopt import EPS
+from exopt.rkhs_functions import Profile, spectrum
+
+# largest allowed amplitude of the fundamental harmonic
+AMPLITUDE = 1.0
+
+
+def coefficient_bounds(harmonics: int) -> tuple[Profile, Profile]:
+    """Coefficient box as Profile bounds, shrinking with the decay."""
+    scale = AMPLITUDE * spectrum(harmonics)
+    return Profile(-scale, -scale), Profile(scale, scale)
 
 
 @jax.jit
@@ -42,35 +53,49 @@ def log_expected_improvement(mu: Scalar, sigma: Scalar, y_best: Scalar) -> Scala
     return jnp.log(sigma) + log_h
 
 
+def acquisition_loss(surrogate, y_best: Scalar, f: Profile) -> Scalar:
+    """Negative log-EI of a candidate Profile under the surrogate."""
+    mu, cov = surrogate.predict(f.pad_to(surrogate.x.harmonics))
+    return -log_expected_improvement(
+        mu=mu.squeeze(), sigma=cov.squeeze() ** 0.5, y_best=y_best
+    )
+
+
 def latin_hypercube(
-    dim: int, n: int, seed: int, domain: tuple[float, float] = (0.0, 1.0)
+    key: Key, dim: int, n: int, domain: tuple[float, float] = (0.0, 1.0)
 ) -> Float[Array, "n d"]:
-    rng = np.random.default_rng(seed)
-    cells = np.stack([rng.permutation(n) for _ in range(dim)], axis=-1)
-    u = (cells + rng.uniform(size=(n, dim))) / n
-    return jnp.array(u * (domain[1] - domain[0]) + domain[0])
+    """Space-filling design: one point per row and column of a stratified grid."""
+    key_cells, key_jitter = jr.split(key)
+    cells = jax.vmap(jr.permutation, in_axes=(0, None), out_axes=1)(
+        jr.split(key_cells, dim), n
+    )
+    u = (cells + jr.uniform(key_jitter, (n, dim))) / n
+    return u * (domain[1] - domain[0]) + domain[0]
 
 
 def optimize_restarts(
-    loss: Callable[[Float[Array, "p"]], Scalar],
-    candidates: Float[Array, "n p"],
-    bounds: tuple[Float[Array, "p"], Float[Array, "p"]],
+    loss: Callable[[PyTree], Scalar],
+    candidates: PyTree,
+    bounds: tuple[PyTree, PyTree],
     max_restarts: int = 5,
-) -> Float[Array, "p"]:
+) -> PyTree:
     """Screen candidates by loss, polish the best few with L-BFGS-B, keep the winner."""
+    # cheap vectorized screening of all raw candidates (stacked on the leading axis)
     screened = jax.jit(jax.vmap(loss))(candidates)
-    starts = candidates[jnp.argsort(screened)[:max_restarts]]
+    best = jnp.argsort(screened)[:max_restarts]
+    starts = jax.tree.map(lambda c: c[best], candidates)
 
+    # polish the surviving starts in parallel and keep the best local optimum
     solve = lambda x0: vlse.optim.minimise(loss, x0, bounds=bounds)
     results = jax.jit(jax.vmap(solve))(starts)
-    return results.x[jnp.argmin(results.f)]
+    winner = jnp.argmin(results.f)
+    return jax.tree.map(lambda a: a[winner], results.x)
 
 
-def loss_function(trace: np.ndarray, beta: float = 5.0) -> float:
-    power = np.stack([
-        trace["torque_0"] * trace["velocity_0"],
-        trace["torque_1"] * trace["velocity_1"],
-    ])
-    positive = power[power > 0]
-    negative = power[power < 0]
-    return float((positive.sum() + beta * negative.sum()) / power.size)
+def objective(trace: np.ndarray, beta: float = 5.0) -> float:
+    """Mean assistance power over a trace, penalizing negative power by beta."""
+    power0 = trace["torque_0"] * trace["velocity_0"]
+    power1 = trace["torque_1"] * trace["velocity_1"]
+    power = jnp.stack([power0, power1])
+    power = jnp.where(power < 0, beta * power, power)  # penalize negative power more
+    return float(jnp.mean(power))

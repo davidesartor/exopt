@@ -15,7 +15,7 @@ dependencies = [
 [project.scripts]
 mock-stream = "exopt.mock_controller:main"
 bo-loop = "exopt.bo_loop:main"
-exo-view = "exopt.animate:main"
+exo-view = "exopt.visualizations:main"
 
 [build-system]
 requires = ["hatchling"]

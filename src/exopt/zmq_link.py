@@ -1,15 +1,14 @@
 """Driver <-> controller exchange: ZMQ pub/sub link and payload encoding."""
 
-from typing import cast
-
 import jax.numpy as jnp
 import zmq
 
+from typing import cast
 from exopt import rkhs_functions
-from exopt.rkhs_functions import Profile
 
-SAMPLE_PORT = 5555
-PROFILE_PORT = 5556
+# link parameters
+SAMPLE_PORT = 5555  # controller PUB -> driver SUB, one JSON dict per control step
+PROFILE_PORT = 5556  # driver PUB -> controller SUB, one JSON dict per profile swap
 
 
 def controller_link(
@@ -63,23 +62,24 @@ def collect_segment(
         if not samples.poll(1000):
             profiles.send_json(payload)
             continue
+
+        # keep only samples tagged with the requested profile
         sample = cast(dict, samples.recv_json())
         if sample["profile_id"] == payload["id"]:
             collected.append(sample)
     return collected[warmup:]
 
 
-def profile_payload(amplitude, phase, harmonics: int) -> dict:
+def profile_payload(profile: rkhs_functions.Profile) -> dict:
+    """JSON-safe encoding of a candidate's Fourier coefficients."""
     return dict(
-        harmonics=harmonics,
-        amplitudes=[float(a) for a in amplitude],
-        phases=[float(p) for p in phase],
+        sin=[float(c) for c in profile.sin],
+        cos=[float(c) for c in profile.cos],
     )
 
 
-def config_torque_profile(payload: dict) -> Profile:
-    return rkhs_functions.from_atoms(
-        jnp.asarray(payload["amplitudes"]),
-        jnp.asarray(payload["phases"]),
-        payload["harmonics"],
+def config_torque_profile(payload: dict) -> rkhs_functions.Profile:
+    """Decode a payload back into a callable Profile."""
+    return rkhs_functions.Profile(
+        jnp.asarray(payload["sin"]), jnp.asarray(payload["cos"])
     )

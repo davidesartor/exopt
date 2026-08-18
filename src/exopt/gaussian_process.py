@@ -1,105 +1,113 @@
 """Distance-based GP surrogate with estimated constant mean."""
 
-from typing import NamedTuple, Self
+from typing import NamedTuple
+from jaxtyping import Array, Float, Scalar
 
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import vlse
-from jaxtyping import Array, Float, Scalar
-
-from exopt.rkhs_functions import EPS
-
-NUGGET_RANGE = (EPS, 1e-3)
 
 
-class Gaussian(NamedTuple):
-    mean: Float[Array, "n"]
-    cov: Float[Array, "n n"]
+from exopt import rkhs_functions
+from exopt.rkhs_functions import Profile
 
 
 @jax.jit
 def loglikelihood(
-    Koo: Float[Array, "n n"], ys: Float[Array, "n"]
+    Koo: Float[Array, "n n"], y: Float[Array, "n"]
 ) -> tuple[Scalar, Scalar, Scalar]:
+    """Profile log-likelihood with mean b and scale nu solved in closed form."""
     K_sqrt, is_lower = jsp.linalg.cho_factor(Koo)
     logdetK = 2.0 * jnp.sum(jnp.log(jnp.diag(K_sqrt)))
 
+    # solve K^-1 @ [1, y] in one factorized triangular solve
     Ki_1, Ki_y = jsp.linalg.cho_solve(
         c_and_lower=(K_sqrt, is_lower),
-        b=jnp.stack([jnp.ones_like(ys), ys], 1),
+        b=jnp.stack([jnp.ones_like(y), y], 1),
     ).T
 
-    b = (Ki_1 * ys).sum() / Ki_1.sum()
-    nu = jnp.dot((ys - b) / len(ys), (Ki_y - Ki_1 * b))
+    # closed-form estimates of the constant mean and the signal scale
+    b = (Ki_1 * y).sum() / Ki_1.sum()
+    nu = jnp.dot((y - b) / len(y), (Ki_y - Ki_1 * b))
 
-    loglik = -0.5 * (len(ys) * jnp.log(nu) + logdetK)
+    loglik = -0.5 * (len(y) * jnp.log(nu) + logdetK)
     return loglik, b, nu
 
 
-@jax.jit
-def gp_posterior(
-    Kxx: Float[Array, "m m"],
-    Kox: Float[Array, "n m"],
-    Koo_sqrt: Float[Array, "n n"],
-    Koo_inv_sum: Scalar,
-    observed_ys: Float[Array, "n"],
-    b: Scalar,
-    nu: Scalar,
-) -> Gaussian:
-    gain = jsp.linalg.cho_solve((Koo_sqrt, True), Kox).T
-    mean = b + gain @ (observed_ys - b)
-    cov = nu * (Kxx - gain @ Kox)
-
-    # uncertainty of the estimated constant mean
-    Kbx = jnp.ones((1, len(observed_ys))) @ gain.T
-    cov = cov + nu * (1 - Kbx).T @ (1 - Kbx) / Koo_inv_sum
-    return Gaussian(mean=mean, cov=cov)
-
-
-def se_kernel(dists: Float[Array, "n m"], lengthscale: Scalar) -> Float[Array, "n m"]:
-    return jnp.exp(-0.5 * (dists / lengthscale) ** 2)
+def correlation_matrix(
+    weights: Float[Array, "H"], fs: Profile, gs: Profile
+) -> Float[Array, "n m"]:
+    """Squared-exponential correlations under the per-harmonic metric."""
+    sqd = rkhs_functions.squared_differences(
+        Profile(fs.sin[:, None], fs.cos[:, None]), gs
+    )
+    return jnp.exp(-0.5 * rkhs_functions.weighted_sq_distances(sqd, weights))
 
 
 class GaussianProcess(NamedTuple):
-    lengthscale: Scalar
+    """Fitted surrogate: MLE hyperparameters plus cached training factorizations."""
+
+    weights: Float[Array, "H"]
     nugget: Scalar
     b: Scalar
     nu: Scalar
-    observed_ys: Float[Array, "n"]
+    x: Profile
+    y: Float[Array, "n"]
     Koo_sqrt: Float[Array, "n n"]
     Koo_inv_sum: Scalar
 
-    @classmethod
-    def fit(cls, dists: Float[Array, "n n"], ys: Float[Array, "n"]) -> Self:
-        off_diag = dists[jnp.triu_indices(len(ys), k=1)]
-        ls_range = (
-            max(float(jnp.quantile(off_diag, 0.05)) / 3, EPS),
-            max(float(jnp.quantile(off_diag, 0.95)) * 3, 10 * EPS),
-        )
+    @staticmethod
+    @jax.jit
+    def fit(
+        x: Profile,
+        y: Float[Array, "n"],
+        *,
+        nugget_range: tuple[float, float] = (1e-2, 1e2),
+        weight_range: tuple[float, float] = (1e-2, 1e2),
+    ):
+        """MLE of per-harmonic weights and nugget, then cache the factorizations."""
 
-        def loss(params: Float[Array, "2"]) -> Scalar:
-            Koo = se_kernel(dists, params[0]) + params[1] * jnp.eye(len(ys))
-            return -loglikelihood(Koo, ys)[0]
+        def loss(log_params: Float[Array, "H+1"]) -> Scalar:
+            params = jnp.exp(log_params)
+            Koo = correlation_matrix(params[:-1], x, x)
+            return -loglikelihood(Koo + params[-1] * jnp.eye(len(y)), y)[0]
 
-        x0 = jnp.array([sum(ls_range) / 2, NUGGET_RANGE[1]])
+        # init weights from the Sobolev decay
+        w0 = 1.0 / rkhs_functions.spectrum(x.harmonics)
+        x0 = jnp.log(jnp.append(w0, 0.1 * nugget_range[1]))
+
+        # maximize the likelihood over log(weights, nugget) in the box
         bounds = (
-            jnp.array([ls_range[0], NUGGET_RANGE[0]]),
-            jnp.array([ls_range[1], NUGGET_RANGE[1]]),
+            jnp.log(jnp.append(w0 * weight_range[0], nugget_range[0])),
+            jnp.log(jnp.append(w0 * weight_range[1], nugget_range[1])),
         )
         result = vlse.optim.minimise(loss, x0, bounds=bounds)
 
-        lengthscale, nugget = result.x
-        Koo = se_kernel(dists, lengthscale) + nugget * jnp.eye(len(ys))
-        _, b, nu = loglikelihood(Koo, ys)
+        # refit at the optimum and cache what predict() needs
+        weights, nugget = jnp.exp(result.x[:-1]), jnp.exp(result.x[-1])
+        Koo = correlation_matrix(weights, x, x) + nugget * jnp.eye(len(y))
+        _, b, nu = loglikelihood(Koo, y)
         Koo_sqrt = jsp.linalg.cho_factor(Koo, lower=True)[0]
-        Koo_inv_sum = jsp.linalg.cho_solve((Koo_sqrt, True), jnp.ones_like(ys)).sum()
-        return cls(lengthscale, nugget, b, nu, ys, Koo_sqrt, Koo_inv_sum)
+        Koo_inv_sum = jsp.linalg.cho_solve((Koo_sqrt, True), jnp.ones_like(y)).sum()
+        return GaussianProcess(weights, nugget, b, nu, x, y, Koo_sqrt, Koo_inv_sum)
 
-    def predict(self, dists_ox: Float[Array, "n"]) -> Gaussian:
-        """Posterior at a single point, given its distances to the observations."""
-        Kxx = jnp.ones((1, 1))
-        Kox = se_kernel(dists_ox[:, None], self.lengthscale)
-        return gp_posterior(
-            Kxx, Kox, self.Koo_sqrt, self.Koo_inv_sum, self.observed_ys, self.b, self.nu
-        )
+    @jax.jit
+    def predict(
+        self, x: Profile
+    ) -> tuple[Float[Array, "... m"], Float[Array, "... m m"]]:
+        """Joint posterior over the trailing stack axis; extra leading axes batch."""
+        x = Profile(jnp.atleast_2d(x.sin), jnp.atleast_2d(x.cos))
+        if x.sin.ndim > 2:
+            return jax.vmap(self.predict)(x)
+        
+        Kxx = correlation_matrix(self.weights, x, x)
+        Kox = correlation_matrix(self.weights, self.x, x)
+        gain = jsp.linalg.cho_solve((self.Koo_sqrt, True), Kox).T
+        mean = self.b + gain @ (self.y - self.b)
+        cov = self.nu * (Kxx - gain @ Kox)
+
+        # uncertainty of the estimated constant mean
+        Kbx = jnp.ones((1, len(self.y))) @ gain.T
+        cov = cov + self.nu * (1 - Kbx).T @ (1 - Kbx) / self.Koo_inv_sum
+        return mean, cov
