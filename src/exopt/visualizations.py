@@ -8,7 +8,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from plotly.subplots import make_subplots
-from exopt import experiment_io, zmq_link
+from exopt import MAX_TORQUE, experiment_io, zmq_link
 
 # drawing parameters
 LEG_LENGTH = 1.0  # leg segment length in plot units
@@ -62,7 +62,7 @@ def progress_figure(exp_dir: str) -> go.Figure:
         shade = 0.25 + 0.75 * (k + 1) / len(history)
         fig.add_trace(
             go.Scatter(
-                x=phase / (2.0 * math.pi), y=np.asarray(profile(phase)),
+                x=phase / (2.0 * math.pi), y=MAX_TORQUE * np.asarray(profile(phase)),
                 mode="lines", name=f"run {run} (loss {loss:.3f})",
                 showlegend=False,
                 line=dict(

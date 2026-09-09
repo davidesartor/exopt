@@ -21,6 +21,7 @@ def propose_next(
     x: Profile,
     y: Float[Array, "n"],
     harmonics: int = 1,
+    amplitude: float = acquisition.AMPLITUDE,
     raw_samples: int = 256,
     max_restarts: int = 16,
 ) -> tuple[Profile, GaussianProcess]:
@@ -30,7 +31,7 @@ def propose_next(
     loss = partial(acquisition.acquisition_loss, surrogate, y.min())
 
     # maximize the acquisition from a screened space-filling start design
-    lower, upper = acquisition.coefficient_bounds(harmonics)
+    lower, upper = acquisition.coefficient_bounds(harmonics, amplitude)
     unit = acquisition.latin_hypercube(key, 2 * harmonics, raw_samples)
     starts = jax.tree.map(
         lambda lo, hi, u: lo + u * (hi - lo),
@@ -66,7 +67,7 @@ def load_dataset(exp_dir: str) -> tuple[Profile, Float[Array, "n"]]:
 def seed_folder(args) -> None:
     """Fill an empty folder with a Latin hypercube design of configs."""
     harmonics = args.harmonics if args.mode == "functional" else 1
-    lower, upper = acquisition.coefficient_bounds(harmonics)
+    lower, upper = acquisition.coefficient_bounds(harmonics, acquisition.INITIAL_AMPLITUDE)
     unit = acquisition.latin_hypercube(jr.key(args.seed), 2 * harmonics, args.n)
     for offset, u in enumerate(unit):
         p = jax.tree.map(
@@ -123,11 +124,14 @@ def propose(args, key: Key) -> None:
     harmonics = 1 if mode == "vector" else args.harmonics
     # pad the history only if the new candidate space is wider
     observed = observed.pad_to(max(observed.harmonics, harmonics))
+    # the amplitude the search may use grows with the number of trials so far
+    amplitude = acquisition.amplitude_cap(len(ys))
     candidate, _ = propose_next(
         key,
         observed,
         ys,
         harmonics=harmonics,
+        amplitude=amplitude,
         raw_samples=args.raw_samples,
         max_restarts=args.max_restarts,
     )
@@ -135,7 +139,7 @@ def propose(args, key: Key) -> None:
     i = experiment_io.next_index(args.exp_dir)
     payload = zmq_link.profile_payload(candidate)
     experiment_io.save_config(args.exp_dir, i, payload)
-    print(f"Proposed config_{i}.json: {payload}")
+    print(f"Proposed config_{i}.json: {payload} (amplitude cap {amplitude:.2f})")
 
 
 def main():

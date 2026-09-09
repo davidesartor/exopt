@@ -6,7 +6,7 @@ import pyCandle
 import jax.numpy as jnp
 
 from tqdm import tqdm
-from exopt import zmq_link
+from exopt import MAX_TORQUE, zmq_link
 
 # control parameters
 EXPERIMENT_TIME = 30 * 60.0  # [s] maximum time to run the experiment
@@ -14,9 +14,7 @@ MIN_CALIBRATION_TIME = 10.0  # [s] minimum time to calibrate the gait period
 CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
 SAMPLING_RATE = 100.0  # [Hz] control loop frequency
 SAMPLING_STEP = 1.0 / SAMPLING_RATE  # [s] control loop period
-TORQUE_SCALE = 5.0  # [Nm] scale factor for the torque
 LOWPASS_SMOOTHING = 0.1  # EMA weight before the phase-estimation
-MAX_TORQUE = 13.0  # [Nm] hardware torque limit per motor
 GAIN_RAMP_TIME = 5.0  # [s] blend from the previous profile to the new one after a swap
 
 
@@ -139,7 +137,7 @@ if __name__ == "__main__":
                 profile_torque = blend * torque_profile(gait_phase) + (
                     1 - blend
                 ) * prev_torque_profile(gait_phase)
-                torque = TORQUE_SCALE * profile_torque
+                torque = MAX_TORQUE * jnp.clip(profile_torque, -1.0, 1.0)
                 for md, tau in zip(candle.md80s, torque):
                     md.setTargetTorque(float(tau))
 

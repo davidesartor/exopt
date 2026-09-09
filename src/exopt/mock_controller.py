@@ -7,16 +7,14 @@ import vlse
 
 from jaxtyping import Array, Float
 from tqdm import tqdm
-from exopt import zmq_link
+from exopt import MAX_TORQUE, zmq_link
 
 # simulation parameters
 SIMULATION_TIME = 60.0  # [s] maximum time to run the simulation
 CALIBRATION_TIME = 5.0  # [s] time to calibrate the gait period
 SAMPLING_RATE = 100.0  # [Hz] control loop frequency
 SAMPLING_STEP = 1.0 / SAMPLING_RATE  # [s] control loop period
-TORQUE_SCALE = 5.0  # [Nm] scale factor for the torque
 LOWPASS_SMOOTHING = 0.5  # EMA weight before the phase-estimation
-# NOTE: are the torque units correct?
 
 # subject parameters
 TRUE_GAIT_PERIOD = 1.0  # [s] time for one gait cycle (2 steps, 1 per leg)
@@ -90,7 +88,7 @@ if __name__ == "__main__":
             smooth_position += LOWPASS_SMOOTHING * (position - smooth_position)
             smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
             gait_phase = jnp.arctan2(smooth_velocity / gait_omega, smooth_position)
-            torque = TORQUE_SCALE * torque_profile(gait_phase)
+            torque = MAX_TORQUE * jnp.clip(torque_profile(gait_phase), -1.0, 1.0)
 
             # simulate a control loop step
             time.sleep(SAMPLING_STEP)

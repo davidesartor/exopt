@@ -13,13 +13,24 @@ from jaxtyping import Array, Float, Key, PyTree, Scalar
 from exopt import EPS
 from exopt.rkhs_functions import Profile, spectrum
 
-# largest allowed amplitude of the fundamental harmonic
+# coefficients are fractions of MAX_TORQUE: the fundamental may reach the limit,
+# but only after the search box has ramped up over the first trials
 AMPLITUDE = 1.0
+INITIAL_AMPLITUDE = 0.15
+AMPLITUDE_TRIALS = 20
 
 
-def coefficient_bounds(harmonics: int) -> tuple[Profile, Profile]:
+def amplitude_cap(trials: int) -> float:
+    """Amplitude allowed after `trials` observations, ramping to full scale."""
+    ramp = min(trials / AMPLITUDE_TRIALS, 1.0)
+    return INITIAL_AMPLITUDE + ramp * (AMPLITUDE - INITIAL_AMPLITUDE)
+
+
+def coefficient_bounds(
+    harmonics: int, amplitude: float = AMPLITUDE
+) -> tuple[Profile, Profile]:
     """Coefficient box as Profile bounds, shrinking with the decay."""
-    scale = AMPLITUDE * spectrum(harmonics)
+    scale = amplitude * spectrum(harmonics)
     return Profile(-scale, -scale), Profile(scale, scale)
 
 
