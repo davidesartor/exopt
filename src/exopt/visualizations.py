@@ -28,15 +28,15 @@ def load_history(exp_dir: str):
     ]
 
 
-def progress_figure(exp_dir: str, minimize: bool = True) -> go.Figure:
+def progress_figure(exp_dir: str) -> go.Figure:
     """Dashboard: loss history with best-so-far, and every torque profile tried."""
     history = load_history(exp_dir)
     if not history:
         return go.Figure(layout=dict(title=f"{exp_dir} — no completed runs"))
     runs = [i for i, _, _ in history]
     losses = np.array([loss for _, _, loss in history])
-    best = np.minimum.accumulate(losses) if minimize else np.maximum.accumulate(losses)
-    best_run = runs[int(losses.argmin() if minimize else losses.argmax())]
+    best = np.minimum.accumulate(losses)
+    best_run = runs[int(losses.argmin())]
 
     fig = make_subplots(
         rows=1, cols=2,
@@ -83,8 +83,7 @@ def progress_figure(exp_dir: str, minimize: bool = True) -> go.Figure:
     return fig
 
 
-def traces_figure(exp_dir: str, minimize: bool = True,
-                  selected: list[int] | None = None) -> go.Figure:
+def traces_figure(exp_dir: str, selected: list[int] | None = None) -> go.Figure:
     """Run diagnostics: position/velocity phase portraits and running mean mechanical power."""
     runs = sorted(experiment_io.run_numbers(exp_dir))
     if selected:
@@ -93,7 +92,7 @@ def traces_figure(exp_dir: str, minimize: bool = True,
         return go.Figure(layout=dict(title=f"{exp_dir} — no runs"))
     completed = [r for r in runs if r in experiment_io.config_numbers(exp_dir)]
     losses = {r: experiment_io.read_result(exp_dir, r) for r in completed}
-    best_run = (min if minimize else max)(losses, key=losses.get) if losses else None
+    best_run = min(losses, key=losses.get) if losses else None
 
     fig = make_subplots(
         rows=1, cols=2,
@@ -208,7 +207,7 @@ def run_figure(exp_dir: str, run: int) -> go.Figure:
     return fig
 
 
-def run_dashboard(exp_dir: str, minimize: bool = True, port: int = 8050):
+def run_dashboard(exp_dir: str, port: int = 8050):
     """Live dashboard: run selector, refreshes progress and trace figures every 2 s."""
     from dash import Dash, Input, Output, State, dcc, html
 
@@ -247,8 +246,7 @@ def run_dashboard(exp_dir: str, minimize: bool = True, port: int = 8050):
         Input("tick", "n_intervals"),
     )
     def refresh_experiment(_):
-        return (progress_figure(exp_dir, minimize=minimize),
-                traces_figure(exp_dir, minimize=minimize))
+        return progress_figure(exp_dir), traces_figure(exp_dir)
 
     @app.callback(
         Output("detail", "figure"),
@@ -356,23 +354,21 @@ def main():
                                            "animation", "all"],
                         default="dashboard")
     parser.add_argument("--port", type=int, default=8050, help="dashboard port")
-    parser.add_argument("--minimize", action="store_true",
-                        help="best-so-far tracks the minimum (default: maximize)")
     parser.add_argument("--swing", type=float, default=45.0, help="max swing angle (deg)")
     parser.add_argument("--fps", type=float, default=25.0, help="playback frame rate")
     args = parser.parse_args()
 
     if args.view == "dashboard":
         webbrowser.open(f"http://127.0.0.1:{args.port}")
-        run_dashboard(args.exp_dir, minimize=args.minimize, port=args.port)
+        run_dashboard(args.exp_dir, port=args.port)
         return
 
     views = ["progress", "traces", "animation"] if args.view == "all" else [args.view]
     for view in views:
         if view == "progress":
-            fig = progress_figure(args.exp_dir, minimize=args.minimize)
+            fig = progress_figure(args.exp_dir)
         elif view == "traces":
-            fig = traces_figure(args.exp_dir, minimize=args.minimize)
+            fig = traces_figure(args.exp_dir)
         else:
             fig = animation_figure(args.exp_dir, args.swing, args.fps)
         out = f"{args.exp_dir}/{view}.html"

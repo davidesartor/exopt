@@ -104,9 +104,9 @@ def sample_power(sample: dict, beta: float = 5.0) -> float:
 
 
 def objective(trace: np.ndarray, beta: float = 5.0) -> float:
-    """Mean assistance power over a trace, penalizing negative power by beta."""
+    """Loss to minimize: minus the mean assistance power, negative power scaled by beta."""
     power0 = trace["torque_0"] * trace["velocity_0"]
     power1 = trace["torque_1"] * trace["velocity_1"]
     power = jnp.stack([power0, power1])
     power = jnp.where(power < 0, beta * power, power)  # penalize negative power more
-    return float(jnp.mean(power))
+    return float(-jnp.mean(power))

@@ -114,10 +114,9 @@ def propose(args, key: Key) -> None:
         mode = experiment_io.newest_mode(args.exp_dir)
 
     observed, ys = load_with_fantasies(args.exp_dir)
-    sign = 1.0 if args.minimize else -1.0
     print(
         f"Loaded {len(ys)} observations (incl. fantasies), "
-        f"best so far: {(sign * ys).min():.6f}"
+        f"best so far: {ys.min():.6f}"
     )
 
     # a vector candidate is a single fundamental harmonic
@@ -127,7 +126,7 @@ def propose(args, key: Key) -> None:
     candidate, _ = propose_next(
         key,
         observed,
-        sign * ys,
+        ys,
         harmonics=harmonics,
         raw_samples=args.raw_samples,
         max_restarts=args.max_restarts,
@@ -179,11 +178,6 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--raw-samples", type=int, default=1024)
     parser.add_argument("--max-restarts", type=int, default=16)
-    parser.add_argument(
-        "--minimize",
-        action="store_true",
-        help="minimize the objective (default: maximize)",
-    )
     args = parser.parse_args()
 
     # connect to the controller and resume (or seed) the experiment folder

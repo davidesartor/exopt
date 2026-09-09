@@ -37,8 +37,9 @@ Each segment runs one profile until its mean converges (`--tol`, capped at
 `--max-samples`), with the first `--warmup` samples dropped after a swap.
 Segments are recorded to `--exp-dir` as `config_i.json` / `run_i.txt` pairs,
 so `bo-loop` resumes an interrupted session, and `--mode functional` continues
-a vector one. `bo-loop` maximizes by default (`--minimize` to flip) and keeps
-proposing until `--duration` minutes of experiment time elapse.
+a vector one. The objective is minus the mean assistance power (negative power
+penalized), always minimized; `bo-loop` keeps proposing until `--duration`
+minutes of experiment time elapse.
 
 The real controller needs only a non-blocking `poll()` of the profile socket
 in its main loop and a `profile_id` tag on each streamed sample (see
