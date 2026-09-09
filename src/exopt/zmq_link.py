@@ -43,12 +43,17 @@ def driver_link(
     return samples, profiles
 
 
+def latest_message(socket: zmq.Socket) -> dict | None:
+    """Drain a SUB socket, returning the newest message if any."""
+    newest = None
+    while socket.poll(0):
+        newest = cast(dict, socket.recv_json())
+    return newest
+
+
 def latest_torque_profile(profiles: zmq.Socket) -> dict | None:
     """Drain the profile socket, returning the newest update if any."""
-    newest = None
-    while profiles.poll(0):
-        newest = cast(dict, profiles.recv_json())
-    return newest
+    return latest_message(profiles)
 
 
 def collect_segment(
