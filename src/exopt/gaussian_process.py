@@ -8,9 +8,7 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import vlse
 
-
-from exopt import rkhs_functions
-from exopt.rkhs_functions import Profile
+from exopt.profiles import Profile, spectrum, squared_differences
 
 
 @jax.jit
@@ -39,10 +37,8 @@ def correlation_matrix(
     weights: Float[Array, "H"], fs: Profile, gs: Profile
 ) -> Float[Array, "n m"]:
     """Squared-exponential correlations under the per-harmonic metric."""
-    sqd = rkhs_functions.squared_differences(
-        Profile(fs.sin[:, None], fs.cos[:, None]), gs
-    )
-    return jnp.exp(-0.5 * rkhs_functions.weighted_sq_distances(sqd, weights))
+    sqd = squared_differences(Profile(fs.sin[:, None], fs.cos[:, None]), gs)
+    return jnp.exp(-0.5 * jnp.maximum(sqd @ weights, 0.0))
 
 
 class GaussianProcess(NamedTuple):
@@ -74,7 +70,7 @@ class GaussianProcess(NamedTuple):
             return -loglikelihood(Koo + params[-1] * jnp.eye(len(y)), y)[0]
 
         # init weights from the Sobolev decay
-        w0 = 1.0 / rkhs_functions.spectrum(x.harmonics)
+        w0 = 1.0 / spectrum(x.harmonics)
         x0 = jnp.log(jnp.append(w0, 0.1 * nugget_range[1]))
 
         # maximize the likelihood over log(weights, nugget) in the box

@@ -1,4 +1,4 @@
-"""Acquisition utilities: stable log-EI, start designs, restart optimization, objective."""
+"""Acquisition: search box and peak limit, stable log-EI, start designs, restart optimization."""
 
 from typing import Callable
 
@@ -6,12 +6,11 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
-import numpy as np
 import vlse
 
 from jaxtyping import Array, Float, Key, PyTree, Scalar
 from exopt import EPS
-from exopt.rkhs_functions import Profile, spectrum
+from exopt.profiles import Profile, spectrum
 
 # profiles are fractions of MAX_TORQUE: the peak may reach the limit,
 # but only after the amplitude cap has ramped up over the first trials
@@ -33,6 +32,13 @@ def coefficient_bounds(
     """Coefficient box as Profile bounds, shrinking with the decay."""
     scale = amplitude * spectrum(harmonics)
     return Profile(-scale, -scale), Profile(scale, scale)
+
+
+def box_points(unit: Float[Array, "n D"], lower: Profile, upper: Profile) -> Profile:
+    """Map unit-cube points (sin then cos coordinates) onto the box, as a batched Profile."""
+    H = lower.harmonics
+    u = Profile(unit[:, :H], unit[:, H:])
+    return jax.tree.map(lambda lo, hi, uu: lo + uu * (hi - lo), lower, upper, u)
 
 
 def limit_peak(f: Profile, amplitude: float = AMPLITUDE) -> Profile:
@@ -110,23 +116,3 @@ def optimize_restarts(
     results = jax.jit(jax.vmap(solve))(starts)
     winner = jnp.argmin(results.f)
     return jax.tree.map(lambda a: a[winner], results.x)
-
-
-def sample_power(sample: dict, beta: float = 5.0) -> float:
-    """Penalized assistance power of one control-loop sample, averaged over legs."""
-    power = np.array(
-        [
-            sample["torque_0"] * sample["velocity_0"],
-            sample["torque_1"] * sample["velocity_1"],
-        ]
-    )
-    return float(np.mean(np.where(power < 0, beta * power, power)))
-
-
-def objective(trace: np.ndarray, beta: float = 5.0) -> float:
-    """Loss to minimize: minus the mean assistance power, negative power scaled by beta."""
-    power0 = trace["torque_0"] * trace["velocity_0"]
-    power1 = trace["torque_1"] * trace["velocity_1"]
-    power = jnp.stack([power0, power1])
-    power = jnp.where(power < 0, beta * power, power)  # penalize negative power more
-    return float(-jnp.mean(power))

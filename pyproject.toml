@@ -9,13 +9,12 @@ dependencies = [
     "jaxvlse>=0.1.3",
     "numpy>=2.3",
     "pyzmq>=27.1.0",
-    "tqdm>=4.70.0",
 ]
 
 [project.scripts]
-mock-stream = "exopt.mock_controller:main"
+exo-controller = "exopt.controller:main"
 bo-loop = "exopt.bo_loop:main"
-exo-view = "exopt.visualizations:main"
+exo-dashboard = "exopt.dashboard:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,6 +23,5 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "dash>=4.4.1",
-    "matplotlib>=3.11.1",
     "plotly>=6.9.0",
 ]
