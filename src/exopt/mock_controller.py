@@ -18,11 +18,15 @@ LOWPASS_SMOOTHING = 0.5  # EMA weight before the phase-estimation
 # subject parameters
 TRUE_GAIT_PERIOD = 1.0  # [s] time for one gait cycle (2 steps, 1 per leg)
 TRUE_GAIT_OMEGA = 2 * jnp.pi / TRUE_GAIT_PERIOD  # [rad/s] gait angular velocity
+LEG_INERTIA = 1.0  # [kg m^2] leg about the hip
+HIP_STIFFNESS = 150.0  # [Nm/rad] subject's impedance around the reference gait
+HIP_DAMPING = 5.0  # [Nm s/rad]
+SUBSTEPS = 10  # integration substeps per control step
 
 
 @jax.jit
 def simulate_legs_state(t: float) -> tuple[Float[Array, "2"], Float[Array, "2"]]:
-    """Leg positions [rad] and angular velocities [rad/s] at gait time t."""
+    """Reference (unassisted) leg positions [rad] and velocities [rad/s] at gait time t."""
 
     def gait_profile(t: float) -> Float[Array, "2"]:
         # the gait phase for each leg, offset by half a gait cycle
@@ -33,6 +37,24 @@ def simulate_legs_state(t: float) -> tuple[Float[Array, "2"], Float[Array, "2"]]
         return 0.5 * jnp.cos(phase) + 0.1 * jnp.sin(2 * phase + 0.5)
 
     return jax.jvp(gait_profile, (t,), (1.0,))
+
+
+@jax.jit
+def deviation_step(
+    deviation: Float[Array, "2"],
+    deviation_rate: Float[Array, "2"],
+    torque: Float[Array, "2"],
+    dt: float,
+) -> tuple[Float[Array, "2"], Float[Array, "2"]]:
+    """Advance the exo-induced deviation from the reference gait: I e'' + c e' + k e = torque."""
+
+    def substep(_, state):
+        e, de = state
+        dde = (torque - HIP_DAMPING * de - HIP_STIFFNESS * e) / LEG_INERTIA
+        de = de + dt / SUBSTEPS * dde
+        return e + dt / SUBSTEPS * de, de
+
+    return jax.lax.fori_loop(0, SUBSTEPS, substep, (deviation, deviation_rate))
 
 
 def main():
@@ -68,10 +90,19 @@ def main():
         time.sleep(SAMPLING_STEP)
     torque_profile = zmq_link.config_torque_profile(payload)
     smooth_position, smooth_velocity = simulate_legs_state(time.monotonic() - start)
+    deviation = deviation_rate = torque = jnp.zeros(2)
+    last_step = time.monotonic()
 
     # run the simulation, streaming samples and updating the profile when a new one arrives
     with tqdm(total=SIMULATION_TIME, desc=f"profile {payload['id']}", unit="s") as pbar:
         while (now := time.monotonic()) - start < SIMULATION_TIME:
+            # the legs respond to the torque applied since the last step (stalls capped)
+            dt = min(now - last_step, 5 * SAMPLING_STEP)
+            deviation, deviation_rate = deviation_step(
+                deviation, deviation_rate, torque, dt
+            )
+            last_step = now
+
             # update the profile if a new one has arrived (republished ids are ignored)
             update = zmq_link.latest_torque_profile(profiles)
             if update is not None and update["id"] != payload["id"]:
@@ -80,7 +111,9 @@ def main():
                 pbar.set_description(f"profile {payload['id']}")
 
             # estimate the gait phase and compute the torque and power for each leg
-            position, velocity = simulate_legs_state(now - start)
+            reference_position, reference_velocity = simulate_legs_state(now - start)
+            position = reference_position + deviation
+            velocity = reference_velocity + deviation_rate
             smooth_position += LOWPASS_SMOOTHING * (position - smooth_position)
             smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
             gait_phase = jnp.arctan2(-smooth_velocity / gait_omega, smooth_position)
