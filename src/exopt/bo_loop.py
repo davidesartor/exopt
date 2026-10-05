@@ -28,7 +28,11 @@ def propose_next(
     """Return the next candidate Profile and the surrogate."""
     # fit the surrogate on RKHS distances between observed profiles
     surrogate = GaussianProcess.fit(x, y)
-    loss = partial(acquisition.acquisition_loss, surrogate, y.min())
+
+    # score each box point as the peak-limited profile the controller will apply
+    def loss(f: Profile):
+        limited = acquisition.limit_peak(f, amplitude)
+        return acquisition.acquisition_loss(surrogate, y.min(), limited)
 
     # maximize the acquisition from a screened space-filling start design
     lower, upper = acquisition.coefficient_bounds(harmonics, amplitude)
@@ -40,7 +44,7 @@ def propose_next(
     candidate = acquisition.optimize_restarts(
         loss, starts, bounds=(lower, upper), max_restarts=max_restarts
     )
-    return candidate, surrogate
+    return acquisition.limit_peak(candidate, amplitude), surrogate
 
 
 def load_dataset(exp_dir: str) -> tuple[Profile, Float[Array, "n"]]:
@@ -74,6 +78,7 @@ def seed_folder(args) -> None:
             lambda lo, hi, uu: lo + uu * (hi - lo),
             lower, upper, Profile(u[:harmonics], u[harmonics:]),
         )
+        p = acquisition.limit_peak(p, acquisition.INITIAL_AMPLITUDE)
         payload = zmq_link.profile_payload(p)
         experiment_io.save_config(args.exp_dir, 1 + offset, payload)
         print(f"config_{1 + offset}.json: {payload}")
@@ -193,14 +198,13 @@ def main():
         seed_folder(args)
 
     deadline = time.monotonic() + 60.0 * args.duration
-    while True:
+    # past the deadline, still-queued configs stay in the folder for a resume
+    while time.monotonic() < deadline:
         # split the folder into completed and still-pending configs
         configs = experiment_io.config_numbers(args.exp_dir)
         done = configs & experiment_io.run_numbers(args.exp_dir)
         pending = sorted(configs - done)
         if not pending:
-            if time.monotonic() >= deadline:
-                break
             key, subkey = jr.split(key)
             propose(args, subkey)
             continue
@@ -211,7 +215,7 @@ def main():
         profiles.send_json(payload)
 
         # while the controller runs it, extend the queue against fantasized outcomes
-        if len(done) >= 2 and time.monotonic() < deadline:
+        if len(done) >= 2:
             key, subkey = jr.split(key)
             propose(args, subkey)
 
@@ -231,6 +235,9 @@ def main():
             f"{experiment_io.read_result(args.exp_dir, i):.6f}"
         )
 
+    done = experiment_io.config_numbers(args.exp_dir) & experiment_io.run_numbers(
+        args.exp_dir
+    )
     print(f"Done: {len(done)} segments in {args.exp_dir}.")
 
 

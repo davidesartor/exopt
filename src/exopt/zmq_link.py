@@ -67,8 +67,9 @@ def collect_segment(
 ) -> list[dict]:
     """Publish the profile and gather samples until the objective estimate converges.
 
-    Stops when the standard error of the mean penalized power falls below
-    tol * max(|mean|, 1), bounded by min_samples and max_samples.
+    Warmup counts from the end of the controller's blend. Stops when the standard
+    error of the mean penalized power falls below tol * max(|mean|, 1), bounded by
+    min_samples and max_samples.
     """
     from exopt import acquisition  # driver-side only; keeps vlse off the controller
 
@@ -81,9 +82,9 @@ def collect_segment(
             profiles.send_json(payload)
             continue
 
-        # keep only samples tagged with the requested profile
+        # keep only samples tagged with the requested profile, once fully blended in
         sample = cast(dict, samples.recv_json())
-        if sample["profile_id"] != payload["id"]:
+        if sample["profile_id"] != payload["id"] or sample.get("blend", 1.0) < 1.0:
             continue
         collected.append(sample)
         n = len(collected) - warmup

@@ -13,11 +13,12 @@ from jaxtyping import Array, Float, Key, PyTree, Scalar
 from exopt import EPS
 from exopt.rkhs_functions import Profile, spectrum
 
-# coefficients are fractions of MAX_TORQUE: the fundamental may reach the limit,
-# but only after the search box has ramped up over the first trials
+# profiles are fractions of MAX_TORQUE: the peak may reach the limit,
+# but only after the amplitude cap has ramped up over the first trials
 AMPLITUDE = 1.0
 INITIAL_AMPLITUDE = 0.15
 AMPLITUDE_TRIALS = 20
+PEAK_GRID = 256  # gait phases on which a profile's peak is evaluated
 
 
 def amplitude_cap(trials: int) -> float:
@@ -32,6 +33,14 @@ def coefficient_bounds(
     """Coefficient box as Profile bounds, shrinking with the decay."""
     scale = amplitude * spectrum(harmonics)
     return Profile(-scale, -scale), Profile(scale, scale)
+
+
+def limit_peak(f: Profile, amplitude: float = AMPLITUDE) -> Profile:
+    """Scale a profile down so its peak over the gait cycle is at most `amplitude`."""
+    phase = jnp.linspace(0.0, 2 * jnp.pi, PEAK_GRID, endpoint=False)
+    peak = jnp.abs(f(phase)).max()
+    shrink = jnp.minimum(1.0, amplitude / jnp.maximum(peak, EPS))
+    return jax.tree.map(lambda c: shrink * c, f)
 
 
 @jax.jit

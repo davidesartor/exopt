@@ -3,7 +3,6 @@
 import time
 import jax
 import jax.numpy as jnp
-import vlse
 
 from jaxtyping import Array, Float
 from tqdm import tqdm
@@ -27,20 +26,16 @@ def simulate_legs_state(t: float) -> tuple[Float[Array, "2"], Float[Array, "2"]]
 
     def gait_profile(t: float) -> Float[Array, "2"]:
         # the gait phase for each leg, offset by half a gait cycle
-        phase0 = (t % TRUE_GAIT_PERIOD) / TRUE_GAIT_PERIOD
-        phase1 = (phase0 + 0.5) % 1.0
-        phase = jnp.array([phase0, phase1])[:, None]
+        phase0 = 2 * jnp.pi * t / TRUE_GAIT_PERIOD
+        phase = jnp.array([phase0, phase0 + jnp.pi])
 
-        # make a periodic gait trajectory from the low-fidelity Forrester model
-        forrester = vlse.ForresterLowFidelity(normalized=True)  # type: ignore
-        profile = forrester(phase) + forrester(1.0 - phase)  # make periodic
-        profile = profile / 15.0 - 1.0  # scale to approx [-1, 1] range
-        return profile
+        # hip-like trajectory: dominant fundamental plus an asymmetric second harmonic
+        return 0.5 * jnp.cos(phase) + 0.1 * jnp.sin(2 * phase + 0.5)
 
     return jax.jvp(gait_profile, (t,), (1.0,))
 
 
-if __name__ == "__main__":
+def main():
     # set up ZMQ sockets for streaming samples and receiving profiles
     samples, profiles = zmq_link.controller_link()
     start = time.monotonic()
@@ -77,8 +72,9 @@ if __name__ == "__main__":
     # run the simulation, streaming samples and updating the profile when a new one arrives
     with tqdm(total=SIMULATION_TIME, desc=f"profile {payload['id']}", unit="s") as pbar:
         while (now := time.monotonic()) - start < SIMULATION_TIME:
-            # update the profile if a new one has arrived
-            if (update := zmq_link.latest_torque_profile(profiles)) is not None:
+            # update the profile if a new one has arrived (republished ids are ignored)
+            update = zmq_link.latest_torque_profile(profiles)
+            if update is not None and update["id"] != payload["id"]:
                 payload = update
                 torque_profile = zmq_link.config_torque_profile(payload)
                 pbar.set_description(f"profile {payload['id']}")
@@ -87,7 +83,7 @@ if __name__ == "__main__":
             position, velocity = simulate_legs_state(now - start)
             smooth_position += LOWPASS_SMOOTHING * (position - smooth_position)
             smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
-            gait_phase = jnp.arctan2(smooth_velocity / gait_omega, smooth_position)
+            gait_phase = jnp.arctan2(-smooth_velocity / gait_omega, smooth_position)
             torque = MAX_TORQUE * jnp.clip(torque_profile(gait_phase), -1.0, 1.0)
 
             # simulate a control loop step
@@ -111,3 +107,7 @@ if __name__ == "__main__":
                     torque_1=float(torque[1]),
                 )
             )
+
+
+if __name__ == "__main__":
+    main()

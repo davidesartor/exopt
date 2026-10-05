@@ -115,8 +115,9 @@ if __name__ == "__main__":
             total=EXPERIMENT_TIME, desc=f"profile {payload['id']}", unit="s"
         ) as pbar:
             while (now := time.monotonic()) - start < EXPERIMENT_TIME:
-                # update the profile if a new one has arrived
-                if (update := zmq_link.latest_torque_profile(profiles)) is not None:
+                # update the profile if a new one has arrived (republished ids are ignored)
+                update = zmq_link.latest_torque_profile(profiles)
+                if update is not None and update["id"] != payload["id"]:
                     payload = update
                     prev_torque_profile = torque_profile
                     torque_profile = zmq_link.config_torque_profile(payload)
@@ -131,7 +132,7 @@ if __name__ == "__main__":
                     position - position_offset - smooth_position
                 )
                 smooth_velocity += LOWPASS_SMOOTHING * (velocity - smooth_velocity)
-                gait_phase = jnp.arctan2(smooth_velocity / gait_omega, smooth_position)
+                gait_phase = jnp.arctan2(-smooth_velocity / gait_omega, smooth_position)
                 # blend from the previous profile to the new one after a swap
                 blend = min((now - profile_swap_at) / GAIN_RAMP_TIME, 1.0)
                 profile_torque = blend * torque_profile(gait_phase) + (
@@ -152,6 +153,7 @@ if __name__ == "__main__":
                 samples.send_json(
                     dict(
                         profile_id=payload["id"],
+                        blend=blend,
                         time=now - start,
                         gait_phase0=float(gait_phase[0]),
                         gait_phase1=float(gait_phase[1]),
