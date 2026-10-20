@@ -30,9 +30,14 @@ def driver_link(host: str = "localhost") -> tuple[zmq.Socket, zmq.Socket]:
     """
     ctx = zmq.Context.instance()
     samples = ctx.socket(zmq.SUB)
+    # heartbeat so a controller restart behind the ssh tunnel drops and reconnects the link
+    samples.setsockopt(zmq.HEARTBEAT_IVL, 1000)
+    samples.setsockopt(zmq.HEARTBEAT_TIMEOUT, 3000)
     samples.connect(f"tcp://{host}:{SAMPLE_PORT}")
     samples.setsockopt_string(zmq.SUBSCRIBE, "")
     profiles = ctx.socket(zmq.PUB)
+    profiles.setsockopt(zmq.HEARTBEAT_IVL, 1000)
+    profiles.setsockopt(zmq.HEARTBEAT_TIMEOUT, 3000)
     profiles.connect(f"tcp://{host}:{PROFILE_PORT}")
     return samples, profiles
 
