@@ -15,21 +15,46 @@ from plotly.subplots import make_subplots
 from exopt import MAX_TORQUE, link, trials
 
 LIVE_WINDOW = 30.0  # [s] live history shown
+LIVE_STRIDE = 4  # plot every 4th sample, so a refresh stays well under its interval
 LEG_LENGTH = 1.0  # leg segment length in animation units
 COLORS = ["#d62728", "#1f77b4"]  # one color per leg
 BEST_COLOR = "#d62728"
+STAGE_RGB = ["31,119,180", "255,127,14", "44,160,44", "148,103,189"]  # indexed by harmonics - 1
 
 
-def shade(k: int, n: int, best: bool) -> str:
-    """Old trials light, new ones dark, the best one red."""
-    return BEST_COLOR if best else f"rgba(31,119,180,{0.2 + 0.8 * (k + 1) / n:.2f})"
+def stage_rgb(harmonics: int) -> str:
+    return STAGE_RGB[(harmonics - 1) % len(STAGE_RGB)]
+
+
+def visibility(history: list[trials.Trial]) -> np.ndarray:
+    """Line opacity per trial from its loss rank: the best opaque, the worst faint."""
+    rank = np.argsort(np.argsort([t.loss for t in history]))
+    quality = 1.0 - rank / max(len(history) - 1, 1)
+    return 0.05 + 0.95 * quality**2
+
+
+def trial_color(trial: trials.Trial, alpha: float, stage_best: set[int]) -> str:
+    """Stage color at the given opacity, red for the best trial of each stage."""
+    return BEST_COLOR if trial.index in stage_best else f"rgba({stage_rgb(trial.profile.harmonics)},{alpha:.2f})"
+
+
+def stages(history: list[trials.Trial]) -> dict[int, list[trials.Trial]]:
+    """Trials grouped by the number of harmonics of their profile, in order of appearance."""
+    grouped: dict[int, list[trials.Trial]] = {}
+    for t in history:
+        grouped.setdefault(t.profile.harmonics, []).append(t)
+    return grouped
+
+
+def stage_name(harmonics: int) -> str:
+    return "sinusoid" if harmonics == 1 else f"{harmonics} harmonics"
 
 
 def live_figure(window: list[dict]) -> go.Figure:
-    """Position, velocity and commanded torque of both legs over the live window."""
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=("position", "velocity", "torque"))
+    """Position, velocity, commanded torque and estimated phase of both legs over the live window."""
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, subplot_titles=("position", "velocity", "torque", "phase"))
     t = [s["time"] for s in window]
-    for row, (kind, unit) in enumerate([("position", "rad"), ("velocity", "rad/s"), ("torque", "Nm")], 1):
+    for row, (kind, unit) in enumerate([("position", "rad"), ("velocity", "rad/s"), ("torque", "Nm"), ("phase", "rad")], 1):
         for leg in (0, 1):
             fig.add_scatter(
                 x=t, y=[s[f"{kind}_{leg}"] for s in window], row=row, col=1,
@@ -37,52 +62,71 @@ def live_figure(window: list[dict]) -> go.Figure:
                 line=dict(color=COLORS[leg]),
             )
         fig.update_yaxes(title_text=unit, row=row, col=1)
-    fig.update_xaxes(title_text="time (s)", row=3, col=1)
-    fig.update_layout(height=750, margin=dict(l=40, r=10, t=40, b=40), uirevision="keep")
+    fig.update_xaxes(title_text="time (s)", row=4, col=1)
+    fig.update_layout(height=1000, margin=dict(l=40, r=10, t=40, b=40), uirevision="keep")
     return fig
 
 
 def progress_figure(history: list[trials.Trial]) -> go.Figure:
-    """Loss per trial with the best so far, and every torque profile tried."""
+    """Loss per trial with each stage's best so far, and every torque profile tried, better ones more opaque."""
     if not history:
-        return go.Figure(layout=dict(title="no trials yet"))
-    index = [t.index for t in history]
-    losses = np.array([t.loss for t in history])
-    best = int(losses.argmin())
-
+        return go.Figure(layout=dict(title="no trials shown"))
+    grouped = stages(history)
     fig = make_subplots(rows=1, cols=2, subplot_titles=("loss per trial", "torque profiles over gait phase"))
-    fig.add_scatter(x=index, y=losses, mode="markers", name="trial loss", marker=dict(size=9, color="#1f77b4"), row=1, col=1)
-    fig.add_scatter(
-        x=index, y=np.minimum.accumulate(losses), mode="lines", name="best so far",
-        line=dict(color=BEST_COLOR, width=2, shape="hv"), row=1, col=1,
-    )
+    summary = []
+    for harmonics, group in grouped.items():
+        rgb, name = stage_rgb(harmonics), stage_name(harmonics)
+        index = [t.index for t in group]
+        losses = np.array([t.loss for t in group])
+        best = int(losses.argmin())
+        summary.append(f"{name}: {len(group)} trials, best {losses[best]:.3f} (trial {index[best]})")
+
+        # stage band, its trial losses and its own best-so-far staircase
+        fig.add_vrect(
+            x0=index[0] - 0.5, x1=index[-1] + 0.5, fillcolor=f"rgba({rgb},0.1)", line_width=0,
+            annotation_text=name, annotation_position="top left", row=1, col=1,
+        )
+        fig.add_scatter(
+            x=index, y=losses, mode="markers", name=name, legendgroup=name,
+            marker=dict(size=9, color=f"rgb({rgb})"), row=1, col=1,
+        )
+        fig.add_scatter(
+            x=index, y=np.minimum.accumulate(losses), mode="lines", name=f"{name} best so far", legendgroup=name,
+            line=dict(color=f"rgb({rgb})", width=2, shape="hv"), row=1, col=1,
+        )
+
+    # every profile overlaid, worst first so the best are drawn on top
     phase = np.linspace(0.0, 2.0 * math.pi, 200)
-    for k, t in enumerate(history):
+    alpha = visibility(history)
+    stage_best = {min(group, key=lambda t: t.loss).index for group in grouped.values()}
+    for k in np.argsort(alpha):
+        t = history[k]
         fig.add_scatter(
             x=phase / (2.0 * math.pi), y=MAX_TORQUE * np.asarray(t.profile(phase)),
             mode="lines", name=f"trial {t.index} (loss {t.loss:.3f})", showlegend=False,
-            line=dict(color=shade(k, len(history), k == best), width=3 if k == best else 1.5),
+            line=dict(color=trial_color(t, alpha[k], stage_best), width=3 if t.index in stage_best else 1.5),
             row=1, col=2,
         )
     fig.update_xaxes(title_text="trial", row=1, col=1)
     fig.update_yaxes(title_text="loss", row=1, col=1)
     fig.update_xaxes(title_text="gait phase (cycles)", row=1, col=2)
     fig.update_yaxes(title_text="torque (Nm)", row=1, col=2)
-    fig.update_layout(title=f"{len(history)} trials, best {losses[best]:.4f} (trial {index[best]}, red)")
+    fig.update_layout(title=" · ".join(summary) + " (best of each stage red)")
     return fig
 
 
 def traces_figure(history: list[trials.Trial]) -> go.Figure:
-    """Phase portraits and running mean penalized power of every trial."""
+    """Phase portraits and running mean penalized power of every trial, better ones more opaque."""
     if not history:
         return go.Figure()
-    best = int(np.argmin([t.loss for t in history]))
     fig = make_subplots(rows=1, cols=2, subplot_titles=("phase portrait", "running mean penalized power"))
-    for k, t in enumerate(history):
-        s = t.samples
+    alpha = visibility(history)
+    stage_best = {min(group, key=lambda t: t.loss).index for group in stages(history).values()}
+    for k in np.argsort(alpha):
+        t, s = history[k], history[k].samples
         style = dict(
             mode="lines", name=f"trial {t.index} (loss {t.loss:.3f})", showlegend=False,
-            line=dict(color=shade(k, len(history), k == best), width=2.5 if k == best else 1),
+            line=dict(color=trial_color(t, alpha[k], stage_best), width=2.5 if t.index in stage_best else 1),
         )
         for leg in (0, 1):
             fig.add_scatter(x=s[f"position_{leg}"], y=s[f"velocity_{leg}"], row=1, col=1, **style)
@@ -143,7 +187,11 @@ def run_dashboard(exp_dir: str, host: str, port: int):
 
     def pump():
         while True:
-            buffer.append(cast(dict, samples.recv_json()))
+            sample = cast(dict, samples.recv_json())
+            # a controller restart resets its clock: drop the previous run
+            if buffer and sample["time"] < buffer[-1]["time"]:
+                buffer.clear()
+            buffer.append(sample)
 
     threading.Thread(target=pump, daemon=True).start()
 
@@ -155,6 +203,7 @@ def run_dashboard(exp_dir: str, host: str, port: int):
                 dcc.Graph(id="live"),
             ]),
             dcc.Tab(label="experiment", value="experiment", children=[
+                dcc.Checklist(id="stages", inline=True, style=dict(padding="0.5em 1em")),
                 dcc.Graph(id="progress"),
                 dcc.Graph(id="traces"),
             ]),
@@ -163,7 +212,7 @@ def run_dashboard(exp_dir: str, host: str, port: int):
                 dcc.Graph(id="detail"),
             ]),
         ]),
-        dcc.Interval(id="fast", interval=200),
+        dcc.Interval(id="fast", interval=500),
         dcc.Interval(id="slow", interval=2000),
     ])
 
@@ -173,20 +222,28 @@ def run_dashboard(exp_dir: str, host: str, port: int):
         if not data:
             return go.Figure(), f"no samples from {host}"
         last = data[-1]
-        window = [s for s in data if s["time"] > last["time"] - LIVE_WINDOW]
+        window = [s for s in data if s["time"] > last["time"] - LIVE_WINDOW][::LIVE_STRIDE]
         status = f"{last['stage']} · profile {last['profile_id']} · blend {last['blend']:.2f}"
         return live_figure(window), status
 
     @app.callback(
         Output("progress", "figure"), Output("traces", "figure"),
         Output("trial", "options"), Output("trial", "value"),
-        Input("slow", "n_intervals"), State("trial", "value"),
+        Output("stages", "options"), Output("stages", "value"),
+        Input("slow", "n_intervals"), Input("stages", "value"),
+        State("trial", "value"), State("stages", "options"),
     )
-    def refresh_experiment(_, selected):
+    def refresh_experiment(_, shown, selected, known):
         history = trials.load(exp_dir)
         index = [t.index for t in history]
         selected = selected if selected in index else (index[-1] if index else None)
-        return progress_figure(history), traces_figure(history), index, selected
+
+        # stages start shown, including ones that appear mid-session
+        options = [{"label": stage_name(h), "value": h} for h in stages(history)]
+        known = {o["value"] for o in known or []}
+        shown = (shown or []) + [o["value"] for o in options if o["value"] not in known]
+        history = [t for t in history if t.profile.harmonics in shown]
+        return progress_figure(history), traces_figure(history), index, selected, options, shown
 
     @app.callback(Output("detail", "figure"), Input("trial", "value"), Input("slow", "n_intervals"))
     def refresh_detail(selected, _):
