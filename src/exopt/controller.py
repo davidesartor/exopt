@@ -15,6 +15,9 @@ SAMPLING_STEP = 0.01  # [s] control loop period
 MIN_CALIBRATION_TIME = 10.0  # [s] minimum time to calibrate the gait frequency
 CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
 LOWPASS_SMOOTHING = 0.1  # EMA weight before the phase estimation
+CROSSING_HYSTERESIS = 0.3  # zero-crossing band, as a fraction of the position RMS
+MIN_CROSSING_BAND = 0.03  # [rad] floor of the band, so standing noise never counts as strides
+STRIDES_KEPT = 6  # recent stride periods whose median sets omega
 GAIN_RAMP_TIME = 5.0  # [s] blend from the previous profile to the new one after a swap
 
 # simulated subject
@@ -101,27 +104,48 @@ class SimulatedLegs:
         pass
 
 
+def ema_response(smoothing: float, omega: float) -> complex:
+    """Frequency response of the per-step EMA y += smoothing * (x - y) at omega [rad/s]."""
+    return smoothing / (1 - (1 - smoothing) * np.exp(-1j * omega * SAMPLING_STEP))
+
+
 class PhaseEstimator:
-    """Gait phase arctan2(-v/omega, x), with omega^2 = <v^2>/<x^2> calibrated until stable."""
+    """Gait phase arctan2(-v/omega, x), with omega from position zero crossings calibrated until stable.
+
+    The filters' mean phase lag at the calibrated omega is subtracted from the estimate.
+    """
 
     def __init__(self):
         self.calibrated = False
-        self.n, self.offset = 0, np.zeros(2)
-        self.sum_sq_position = self.sum_sq_velocity = 0.0
+        self.n, self.offset, self.sum_sq_position = 0, np.zeros(2), 0.0
+        self.below, self.rising_at = np.zeros(2, bool), ([], [])
         self.omega = self.checked_omega = self.started_at = self.checked_at = None
 
     def calibrate(self, now: float, position: np.ndarray, velocity: np.ndarray) -> None:
-        """Accumulate the stride-frequency statistics; calibrated once omega drifts < tol per second."""
+        """Time the strides from rising zero crossings; calibrated once omega drifts < tol per second."""
         if self.started_at is None:
             self.started_at = self.checked_at = now
 
         # center position on its running mean (the encoder zero is unreliable)
         self.n += 1
         self.offset = self.offset + (position - self.offset) / self.n
-        self.sum_sq_position += float(np.sum((position - self.offset) ** 2))
-        self.sum_sq_velocity += float(np.sum(velocity**2))
-        if self.sum_sq_position > 0.0:
-            self.omega = (self.sum_sq_velocity / self.sum_sq_position) ** 0.5
+        centered = position - self.offset
+        self.sum_sq_position += float(np.sum(centered**2))
+
+        # rising zero crossings with hysteresis keep the fundamental, unlike <v^2>/<x^2>
+        band = max(CROSSING_HYSTERESIS * (self.sum_sq_position / (2 * self.n)) ** 0.5, MIN_CROSSING_BAND)
+        for leg in (0, 1):
+            if centered[leg] < -band:
+                self.below[leg] = True
+            elif centered[leg] > band and self.below[leg]:
+                self.below[leg] = False
+                self.rising_at[leg].append(now)
+                del self.rising_at[leg][:-STRIDES_KEPT - 1]
+
+        # median of the recent stride periods, so the start of walking is forgotten
+        if all(len(times) > STRIDES_KEPT for times in self.rising_at):
+            period = np.median([np.diff(times) for times in self.rising_at])
+            self.omega = 2 * np.pi / period
 
         # once per second, check the drift of the estimate
         if now - self.checked_at < 1.0:
@@ -135,6 +159,13 @@ class PhaseEstimator:
             self.offset_smoothing = SAMPLING_STEP * self.omega / (2 * np.pi)
             self.smooth_position, self.smooth_velocity = position - self.offset, velocity
 
+            # mean lag of the estimate on a sinusoid through the centering and lowpass filters
+            lowpass = ema_response(LOWPASS_SMOOTHING, self.omega)
+            centered = lowpass * (1 - ema_response(self.offset_smoothing, self.omega))
+            cycle = np.exp(1j * np.linspace(0.0, 2 * np.pi, 256, endpoint=False))
+            estimate = (centered * cycle).real + 1j * (-1j * lowpass * cycle).real
+            self.lag = float(np.angle(np.mean(estimate / np.abs(estimate) * cycle.conj())))
+
     def __call__(self, position: np.ndarray, velocity: np.ndarray) -> np.ndarray:
         """Phase [rad] of both legs from the lowpassed, centered state."""
         self.offset = self.offset + self.offset_smoothing * (position - self.offset)
@@ -144,7 +175,8 @@ class PhaseEstimator:
         self.smooth_velocity = self.smooth_velocity + LOWPASS_SMOOTHING * (
             velocity - self.smooth_velocity
         )
-        return np.arctan2(-self.smooth_velocity / self.omega, self.smooth_position)
+        phase = np.arctan2(-self.smooth_velocity / self.omega, self.smooth_position)
+        return np.angle(np.exp(1j * (phase - self.lag)))
 
 
 def per_leg(**columns: np.ndarray | None) -> dict:
