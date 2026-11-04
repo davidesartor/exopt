@@ -1,5 +1,3 @@
-"""Distance-based GP surrogate with estimated constant mean."""
-
 from typing import NamedTuple
 from jaxtyping import Array, Float, Scalar
 
@@ -8,102 +6,101 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import vlse
 
-from exopt.profiles import Profile, spectrum, squared_differences
+from exopt.profiles import Profile, squared_distances
+
+NUGGET_RANGE = (1e-2, 1e2)
+LENGTHSCALE_RANGE = (1e-1, 1e1)  # relative to the median distance between observations
 
 
 @jax.jit
-def loglikelihood(
-    Koo: Float[Array, "n n"], y: Float[Array, "n"]
-) -> tuple[Scalar, Scalar, Scalar]:
-    """Profile log-likelihood with mean b and scale nu solved in closed form."""
+def loglikelihood(Koo: Float[Array, "n n"], ys: Float[Array, "n"]) -> tuple[Scalar, Scalar, Scalar]:
+    # cholesky of K and compute logdet
     K_sqrt, is_lower = jsp.linalg.cho_factor(Koo)
     logdetK = 2.0 * jnp.sum(jnp.log(jnp.diag(K_sqrt)))
 
-    # solve K^-1 @ [1, y] in one factorized triangular solve
-    Ki_1, Ki_y = jsp.linalg.cho_solve(
-        c_and_lower=(K_sqrt, is_lower),
-        b=jnp.stack([jnp.ones_like(y), y], 1),
-    ).T
+    # compute Ki_1=(K^-1 @ 1) and Ki_y=(K^-1 @ y)
+    Ki_1, Ki_y = jsp.linalg.cho_solve((K_sqrt, is_lower), jnp.stack([jnp.ones_like(ys), ys], 1)).T
 
-    # closed-form estimates of the constant mean and the signal scale
-    b = (Ki_1 * y).sum() / Ki_1.sum()
-    nu = jnp.dot((y - b) / len(y), (Ki_y - Ki_1 * b))
+    # compute optimal trend b and scale nu
+    b = (Ki_1 * ys).sum() / Ki_1.sum()
+    nu = jnp.dot((ys - b) / len(ys), Ki_y - Ki_1 * b)
 
-    loglik = -0.5 * (len(y) * jnp.log(nu) + logdetK)
+    # likelihood when marginalizing over trend and variance
+    loglik = -0.5 * (len(ys) * jnp.log(nu) + logdetK)
     return loglik, b, nu
 
 
-def correlation_matrix(
-    weights: Float[Array, "H"], fs: Profile, gs: Profile
-) -> Float[Array, "n m"]:
-    """Squared-exponential correlations under the per-harmonic metric."""
-    sqd = squared_differences(Profile(fs.sin[:, None], fs.cos[:, None]), gs)
-    return jnp.exp(-0.5 * jnp.maximum(sqd @ weights, 0.0))
+def correlation(lengthscale: Scalar, fs: Profile, gs: Profile) -> Float[Array, "n m"]:
+    """Squared exponential in the L2 distance between profiles."""
+    return jnp.exp(-0.5 * squared_distances(fs, gs) / lengthscale**2)
+
+
+def mle_loss(log_params: Float[Array, "2"], xs: Profile, ys: Float[Array, "n"]) -> Scalar:
+    lengthscale, nugget = jnp.exp(log_params)
+    Koo = correlation(lengthscale, xs, xs) + nugget * jnp.eye(len(ys))
+    return -loglikelihood(Koo, ys)[0]
 
 
 class GaussianProcess(NamedTuple):
-    """Fitted surrogate: MLE hyperparameters plus cached training factorizations."""
-
-    weights: Float[Array, "H"]
+    # model parameters
+    lengthscale: Scalar
     nugget: Scalar
     b: Scalar
     nu: Scalar
-    x: Profile
-    y: Float[Array, "n"]
+
+    # observed data and cached factorizations
+    xs: Profile
+    ys: Float[Array, "n"]
     Koo_sqrt: Float[Array, "n n"]
     Koo_inv_sum: Scalar
 
     @staticmethod
     @jax.jit
-    def fit(
-        x: Profile,
-        y: Float[Array, "n"],
-        *,
-        nugget_range: tuple[float, float] = (1e-2, 1e2),
-        weight_range: tuple[float, float] = (1e-2, 1e2),
-    ):
-        """MLE of per-harmonic weights and nugget, then cache the factorizations."""
+    def fit(xs: Profile, ys: Float[Array, "n"]) -> "GaussianProcess":
+        # lengthscale range around the median distance between observations
+        d2 = squared_distances(xs, xs)
+        median = jnp.sqrt(jnp.nanmedian(jnp.where(jnp.eye(len(ys), dtype=bool), jnp.nan, d2)))
+        median = jnp.where(jnp.isfinite(median) & (median > 0), median, 1.0)
 
-        def loss(log_params: Float[Array, "H+1"]) -> Scalar:
-            params = jnp.exp(log_params)
-            Koo = correlation_matrix(params[:-1], x, x)
-            return -loglikelihood(Koo + params[-1] * jnp.eye(len(y)), y)[0]
-
-        # init weights from the Sobolev decay
-        w0 = 1.0 / spectrum(x.harmonics)
-        x0 = jnp.log(jnp.append(w0, 0.1 * nugget_range[1]))
-
-        # maximize the likelihood over log(weights, nugget) in the box
+        # maximize the likelihood over log(lengthscale, nugget)
         bounds = (
-            jnp.log(jnp.append(w0 * weight_range[0], nugget_range[0])),
-            jnp.log(jnp.append(w0 * weight_range[1], nugget_range[1])),
+            jnp.log(jnp.array([median * LENGTHSCALE_RANGE[0], NUGGET_RANGE[0]])),
+            jnp.log(jnp.array([median * LENGTHSCALE_RANGE[1], NUGGET_RANGE[1]])),
         )
-        result = vlse.optim.minimise(loss, x0, bounds=bounds)
+        x0 = jnp.log(jnp.array([median, 0.1 * NUGGET_RANGE[1]]))
+        result = vlse.optim.minimise(mle_loss, x0, bounds=bounds, args=(xs, ys))
 
-        # refit at the optimum and cache what predict() needs
-        weights, nugget = jnp.exp(result.x[:-1]), jnp.exp(result.x[-1])
-        Koo = correlation_matrix(weights, x, x) + nugget * jnp.eye(len(y))
-        _, b, nu = loglikelihood(Koo, y)
+        # cache what predict needs
+        lengthscale, nugget = jnp.exp(result.x)
+        Koo = correlation(lengthscale, xs, xs) + nugget * jnp.eye(len(ys))
+        _, b, nu = loglikelihood(Koo, ys)
         Koo_sqrt = jsp.linalg.cho_factor(Koo, lower=True)[0]
-        Koo_inv_sum = jsp.linalg.cho_solve((Koo_sqrt, True), jnp.ones_like(y)).sum()
-        return GaussianProcess(weights, nugget, b, nu, x, y, Koo_sqrt, Koo_inv_sum)
+        Koo_inv_sum = jsp.linalg.cho_solve((Koo_sqrt, True), jnp.ones_like(ys)).sum()
+        return GaussianProcess(lengthscale, nugget, b, nu, xs, ys, Koo_sqrt, Koo_inv_sum)
 
     @jax.jit
-    def predict(
-        self, x: Profile
-    ) -> tuple[Float[Array, "... m"], Float[Array, "... m m"]]:
+    def predict(self, xs: Profile) -> tuple[Float[Array, "... m"], Float[Array, "... m m"]]:
         """Joint posterior over the trailing stack axis; extra leading axes batch."""
-        x = Profile(jnp.atleast_2d(x.sin), jnp.atleast_2d(x.cos))
-        if x.sin.ndim > 2:
-            return jax.vmap(self.predict)(x)
-        
-        Kxx = correlation_matrix(self.weights, x, x)
-        Kox = correlation_matrix(self.weights, self.x, x)
+        if xs.centers.ndim == 1:
+            xs = jax.tree.map(lambda a: a[None], xs)
+        if xs.centers.ndim > 2:
+            return jax.vmap(self.predict)(xs)
+
+        # posterior mean and covariance
+        Kxx = correlation(self.lengthscale, xs, xs)
+        Kox = correlation(self.lengthscale, self.xs, xs)
         gain = jsp.linalg.cho_solve((self.Koo_sqrt, True), Kox).T
-        mean = self.b + gain @ (self.y - self.b)
+        mean = self.b + gain @ (self.ys - self.b)
         cov = self.nu * (Kxx - gain @ Kox)
 
-        # uncertainty of the estimated constant mean
-        Kbx = jnp.ones((1, len(self.y))) @ gain.T
+        # add correction based on the trend estimation correlation
+        Kbx = jnp.ones((1, len(self.ys))) @ gain.T
         cov = cov + self.nu * (1 - Kbx).T @ (1 - Kbx) / self.Koo_inv_sum
         return mean, cov
+
+    def leave_one_out(self) -> tuple[Float[Array, "n"], Float[Array, "n"]]:
+        """Prediction of each observation from all the others (fixed hyperparameters)."""
+        Koo_inv = jsp.linalg.cho_solve((self.Koo_sqrt, True), jnp.eye(len(self.ys)))
+        d = jnp.diag(Koo_inv)
+        mean = self.ys - Koo_inv @ (self.ys - self.b) / d
+        return mean, jnp.sqrt(self.nu / d)

@@ -1,12 +1,12 @@
 """exo-controller: estimate the gait phase, apply the published torque profile, stream samples."""
 
+import jax.numpy as jnp
+import numpy as np
+
 import argparse
 import sys
 import threading
 import time
-
-import jax.numpy as jnp
-import numpy as np
 
 from exopt import MAX_TORQUE, link
 from exopt.profiles import Profile
@@ -26,6 +26,10 @@ LEG_INERTIA = 1.0  # [kg m^2] leg about the hip
 HIP_STIFFNESS = 150.0  # [Nm/rad] subject's impedance around the reference gait
 HIP_DAMPING = 5.0  # [Nm s/rad]
 SUBSTEPS = 10  # integration substeps per control step
+
+
+################################################################################
+# region Legs
 
 
 class HardwareLegs:
@@ -104,6 +108,14 @@ class SimulatedLegs:
         pass
 
 
+# endregion
+################################################################################
+
+
+################################################################################
+# region Phase Estimation
+
+
 def ema_response(smoothing: float, omega: float) -> complex:
     """Frequency response of the per-step EMA y += smoothing * (x - y) at omega [rad/s]."""
     return smoothing / (1 - (1 - smoothing) * np.exp(-1j * omega * SAMPLING_STEP))
@@ -179,6 +191,14 @@ class PhaseEstimator:
         return np.angle(np.exp(1j * (phase - self.lag)))
 
 
+# endregion
+################################################################################
+
+
+################################################################################
+# region Control Loop
+
+
 def per_leg(**columns: np.ndarray | None) -> dict:
     """Flatten two-leg arrays into name_0 / name_1 sample fields."""
     return {
@@ -205,7 +225,7 @@ def main():
         threading.Thread(target=lambda: (input("Press enter to start walking\n"), walking.set()), daemon=True).start()
 
     estimator = PhaseEstimator()
-    zero = Profile(jnp.zeros(1), jnp.zeros(1))
+    zero = Profile(jnp.zeros(1), jnp.zeros(1), jnp.asarray(1.0))
     payload, profile, previous = dict(id=None), zero, zero
     start = swap_at = next_tick = time.monotonic()
     stage = "standing"
@@ -248,6 +268,10 @@ def main():
             time.sleep(max(next_tick - time.monotonic(), 0.0))
     finally:
         legs.close()
+
+
+# endregion
+################################################################################
 
 
 if __name__ == "__main__":

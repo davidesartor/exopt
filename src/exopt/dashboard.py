@@ -19,11 +19,11 @@ LIVE_STRIDE = 4  # plot every 4th sample, so a refresh stays well under its inte
 LEG_LENGTH = 1.0  # leg segment length in animation units
 COLORS = ["#d62728", "#1f77b4"]  # one color per leg
 BEST_COLOR = "#d62728"
-STAGE_RGB = ["31,119,180", "255,127,14", "44,160,44", "148,103,189"]  # indexed by harmonics - 1
+STAGE_RGB = ["31,119,180", "255,127,14", "44,160,44", "148,103,189"]  # indexed by atoms - 1
 
 
-def stage_rgb(harmonics: int) -> str:
-    return STAGE_RGB[(harmonics - 1) % len(STAGE_RGB)]
+def stage_rgb(atoms: int) -> str:
+    return STAGE_RGB[(atoms - 1) % len(STAGE_RGB)]
 
 
 def visibility(history: list[trials.Trial]) -> np.ndarray:
@@ -35,19 +35,19 @@ def visibility(history: list[trials.Trial]) -> np.ndarray:
 
 def trial_color(trial: trials.Trial, alpha: float, stage_best: set[int]) -> str:
     """Stage color at the given opacity, red for the best trial of each stage."""
-    return BEST_COLOR if trial.index in stage_best else f"rgba({stage_rgb(trial.profile.harmonics)},{alpha:.2f})"
+    return BEST_COLOR if trial.index in stage_best else f"rgba({stage_rgb(trial.profile.atoms)},{alpha:.2f})"
 
 
 def stages(history: list[trials.Trial]) -> dict[int, list[trials.Trial]]:
-    """Trials grouped by the number of harmonics of their profile, in order of appearance."""
+    """Trials grouped by the number of atoms of their profile, in order of appearance."""
     grouped: dict[int, list[trials.Trial]] = {}
     for t in history:
-        grouped.setdefault(t.profile.harmonics, []).append(t)
+        grouped.setdefault(t.profile.atoms, []).append(t)
     return grouped
 
 
-def stage_name(harmonics: int) -> str:
-    return "sinusoid" if harmonics == 1 else f"{harmonics} harmonics"
+def stage_name(atoms: int) -> str:
+    return "1 atom" if atoms == 1 else f"{atoms} atoms"
 
 
 def live_figure(window: list[dict]) -> go.Figure:
@@ -74,8 +74,8 @@ def progress_figure(history: list[trials.Trial]) -> go.Figure:
     grouped = stages(history)
     fig = make_subplots(rows=1, cols=2, subplot_titles=("loss per trial", "torque profiles over gait phase"))
     summary = []
-    for harmonics, group in grouped.items():
-        rgb, name = stage_rgb(harmonics), stage_name(harmonics)
+    for atoms, group in grouped.items():
+        rgb, name = stage_rgb(atoms), stage_name(atoms)
         index = [t.index for t in group]
         losses = np.array([t.loss for t in group])
         best = int(losses.argmin())
@@ -242,7 +242,7 @@ def run_dashboard(exp_dir: str, host: str, port: int):
         options = [{"label": stage_name(h), "value": h} for h in stages(history)]
         known = {o["value"] for o in known or []}
         shown = (shown or []) + [o["value"] for o in options if o["value"] not in known]
-        history = [t for t in history if t.profile.harmonics in shown]
+        history = [t for t in history if t.profile.atoms in shown]
         return progress_figure(history), traces_figure(history), index, selected, options, shown
 
     @app.callback(Output("detail", "figure"), Input("trial", "value"), Input("slow", "n_intervals"))

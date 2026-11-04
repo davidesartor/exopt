@@ -1,55 +1,83 @@
-"""Torque profiles as Fourier coefficients and their geometry."""
-
 from typing import NamedTuple, Self
 from jaxtyping import Array, Float
 
 import jax
 import jax.numpy as jnp
 
+from exopt import kernels
+
+ATOM_KERNEL = kernels.SquaredExponential()  # periodized RBF atoms
+RHO_RANGE = (0.3, 2.5)  # atom lengthscales [rad of gait phase]
+
+
+################################################################################
+# region Profiles
+
 
 class Profile(NamedTuple):
-    """A periodic function by its Fourier coefficients on harmonics 1..H."""
+    """Zero-mean torque profile: sum_k weights_k k_per(phase - centers_k; rho)."""
 
-    sin: Float[Array, "... H"]
-    cos: Float[Array, "... H"]
+    centers: Float[Array, "... k"]
+    weights: Float[Array, "... k"]
+    rho: Float[Array, "..."]
 
     @property
-    def harmonics(self) -> int:
-        return self.sin.shape[-1]
+    def atoms(self) -> int:
+        return self.centers.shape[-1]
 
     @jax.jit
     def __call__(self, phase: Float[Array, "..."]) -> Float[Array, "..."]:
-        """Evaluate at gait phase [rad]; one cycle spans 2pi."""
-        angle = jnp.arange(1, self.harmonics + 1) * phase[..., None]
-        return (self.sin * jnp.sin(angle) + self.cos * jnp.cos(angle)).sum(-1)
+        lags = jnp.asarray(phase)[..., None] - self.centers
+        k = kernels.periodic(ATOM_KERNEL, jnp.asarray(self.rho)[..., None], lags)
+        return (self.weights * k).sum(-1)
 
-    def pad_to(self, harmonics: int) -> Self:
-        """Zero-pad the coefficients up to a larger number of harmonics."""
-        pad = [(0, 0)] * (self.sin.ndim - 1) + [(0, harmonics - self.harmonics)]
-        return self._replace(sin=jnp.pad(self.sin, pad), cos=jnp.pad(self.cos, pad))
+    def pad_to(self, atoms: int) -> Self:
+        """Zero-weight atoms change nothing, so padding is exact."""
+        pad = lambda c: jnp.pad(c, [(0, 0)] * (c.ndim - 1) + [(0, atoms - c.shape[-1])])
+        return self._replace(centers=pad(self.centers), weights=pad(self.weights))
+
+    def scale(self, factor: Float[Array, "..."]) -> Self:
+        return self._replace(weights=factor * self.weights)
 
     def to_dict(self) -> dict:
-        """JSON-safe coefficients of a single profile."""
-        return dict(sin=[float(c) for c in self.sin], cos=[float(c) for c in self.cos])
+        floats = lambda a: [float(c) for c in a]
+        return dict(centers=floats(self.centers), weights=floats(self.weights), rho=float(self.rho))
 
     @classmethod
     def from_dict(cls, payload: dict) -> Self:
-        return cls(jnp.asarray(payload["sin"]), jnp.asarray(payload["cos"]))
+        return cls(*(jnp.asarray(payload[k], dtype=float) for k in cls._fields))
 
     @classmethod
     def stack(cls, profiles: list[Self]) -> Self:
-        """One batched Profile, zero-padded to the largest harmonic count."""
-        H = max(p.harmonics for p in profiles)
-        padded = [p.pad_to(H) for p in profiles]
-        return cls(jnp.stack([p.sin for p in padded]), jnp.stack([p.cos for p in padded]))
+        """One batched Profile, padded to the largest atom count."""
+        k = max(p.atoms for p in profiles)
+        return jax.tree.map(lambda *leaves: jnp.stack(leaves), *(p.pad_to(k) for p in profiles))
 
 
-def spectrum(harmonics: int, sobolev_order: float = 1.0) -> Float[Array, "H"]:
-    """Sobolev kernel eigenvalues m^(-2s) on harmonics 1..H."""
-    m = jnp.arange(1, harmonics + 1)
-    return m ** (-2.0 * sobolev_order)
+# endregion
+################################################################################
 
 
-def squared_differences(f: Profile, g: Profile) -> Float[Array, "... H"]:
-    """Per-harmonic squared coefficient differences between two Profiles."""
-    return (f.sin - g.sin) ** 2 + (f.cos - g.cos) ** 2
+################################################################################
+# region L2 Geometry
+
+
+def features(f: Profile) -> Float[Array, "... 2n"]:
+    """Fourier coefficients scaled so their euclidean distance is the L2 distance."""
+    # an atom has coefficients mu_n (cos nc, sin nc), and cos(n.), sin(n.) have norm^2 pi
+    n = kernels.SPECTRAL_HARMONICS
+    gain = jnp.sqrt(jnp.pi) * jnp.exp(kernels.log_eigenvalues(ATOM_KERNEL, f.rho, n))
+    angle = kernels.harmonics(n) * f.centers[..., :, None]
+    sin = gain * (f.weights[..., :, None] * jnp.sin(angle)).sum(-2)
+    cos = gain * (f.weights[..., :, None] * jnp.cos(angle)).sum(-2)
+    return jnp.concatenate([sin, cos], -1)
+
+
+def squared_distances(fs: Profile, gs: Profile) -> Float[Array, "n m"]:
+    zf, zg = features(fs), features(gs)
+    d2 = (zf**2).sum(-1)[:, None] + (zg**2).sum(-1)[None, :] - 2 * zf @ zg.T
+    return jnp.maximum(d2, 0.0)
+
+
+# endregion
+################################################################################

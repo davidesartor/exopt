@@ -1,7 +1,5 @@
-"""Driver <-> controller ZMQ pub/sub link and segment collection."""
-
-import time
 from typing import cast
+import time
 
 import zmq
 

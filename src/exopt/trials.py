@@ -1,15 +1,17 @@
-"""Experiment folder records (one trial_i.json per trial) and the objective."""
-
-import json
+from typing import NamedTuple
 from functools import lru_cache
 from pathlib import Path
-from typing import NamedTuple
+import json
 
 import numpy as np
 
 from exopt.profiles import Profile
 
 BETA = 5.0  # weight of negative (resistive) power in the objective
+
+
+################################################################################
+# region Objective
 
 
 def penalized_power(samples: dict) -> np.ndarray:
@@ -24,6 +26,22 @@ def penalized_power(samples: dict) -> np.ndarray:
 def objective(samples: dict) -> float:
     """Loss to minimize: minus the mean penalized assistance power."""
     return -float(penalized_power(samples).mean())
+
+
+def standard_error(values: np.ndarray, batches: int = 10) -> float:
+    """Standard error of the mean by batch means, robust to the within-cycle correlation."""
+    if len(values) < 2 * batches:
+        return float(np.std(values, ddof=1) / np.sqrt(len(values))) if len(values) > 1 else float("nan")
+    means = np.array([b.mean() for b in np.array_split(values, batches)])
+    return float(means.std(ddof=1) / np.sqrt(batches))
+
+
+# endregion
+################################################################################
+
+
+################################################################################
+# region Records
 
 
 class Trial(NamedTuple):
@@ -45,6 +63,22 @@ def save(exp_dir: str, index: int, profile: Profile, samples: list[dict]) -> Tri
     return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()})
 
 
+def save_current(exp_dir: str, payload: dict) -> None:
+    """Record the profile being run right now (read by the dashboard)."""
+    path = Path(exp_dir) / "current.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+
+
+def load_current(exp_dir: str) -> dict | None:
+    """The profile being run right now, if any."""
+    path = Path(exp_dir) / "current.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 @lru_cache(maxsize=1024)
 def _read(path: Path, mtime: float) -> Trial:
     record = json.loads(path.read_text())
@@ -57,3 +91,7 @@ def load(exp_dir: str) -> list[Trial]:
     paths = Path(exp_dir).glob("trial_*.json")
     trials = [_read(p, p.stat().st_mtime) for p in paths]
     return sorted(trials, key=lambda t: t.index)
+
+
+# endregion
+################################################################################
