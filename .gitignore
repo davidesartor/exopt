@@ -32,10 +32,5 @@ htmlcov/
 .idea/
 .DS_Store
 
-# Experiment data: run folders are bulky and reproducible from a seed, but the
-# aggregated CSVs summarize.py writes are small and worth keeping.
-# Exclude the *contents*, not the directory: git cannot re-include a file whose
-# parent directory is excluded, so "results/" would make the negation dead.
-results/*
-!results/*.csv
+# Experiment data: trial records written by bo-loop
 experiments/

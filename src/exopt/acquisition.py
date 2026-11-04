@@ -10,37 +10,21 @@ import vlse
 
 from exopt import EPS
 from exopt.gaussian_process import GaussianProcess
-from exopt.profiles import RHO_RANGE, Profile
-
-# profiles are fractions of MAX_TORQUE: the peak may reach the limit,
-# but only after the amplitude cap has ramped up over the first trials
-AMPLITUDE = 1.0
-INITIAL_AMPLITUDE = 0.15
-AMPLITUDE_TRIALS = 20
-PEAK_GRID = 256  # gait phases on which a profile's peak is evaluated
+from exopt.profiles import MAX_WEIGHT, RHO_RANGE, Profile
 
 
 ################################################################################
 # region Search Space
 
 
-def amplitude_cap(trials: int) -> float:
-    """Amplitude allowed after `trials` observations, ramping to full scale."""
-    ramp = min(trials / AMPLITUDE_TRIALS, 1.0)
-    return INITIAL_AMPLITUDE + ramp * (AMPLITUDE - INITIAL_AMPLITUDE)
+def bounds(atoms: int) -> tuple[Profile, Profile]:
+    """Atoms anywhere on the cycle, weights up to MAX_WEIGHT, rho within RHO_RANGE.
 
-
-def bounds(atoms: int, amplitude: float = AMPLITUDE) -> tuple[Profile, Profile]:
-    """Atoms anywhere on the cycle, weights up to the amplitude, rho within RHO_RANGE."""
-    lower = Profile(jnp.zeros(atoms), jnp.full(atoms, -amplitude), jnp.asarray(RHO_RANGE[0]))
-    upper = Profile(jnp.full(atoms, 2 * jnp.pi), jnp.full(atoms, amplitude), jnp.asarray(RHO_RANGE[1]))
+    The controller clips the summed profile at MAX_TORQUE.
+    """
+    lower = Profile(jnp.zeros(atoms), jnp.full(atoms, -MAX_WEIGHT), jnp.asarray(RHO_RANGE[0]))
+    upper = Profile(jnp.full(atoms, 2 * jnp.pi), jnp.full(atoms, MAX_WEIGHT), jnp.asarray(RHO_RANGE[1]))
     return lower, upper
-
-
-def limit_peak(f: Profile, amplitude: float = AMPLITUDE) -> Profile:
-    """Scale a profile down so its peak over the gait cycle is at most `amplitude`."""
-    peak = jnp.abs(f(jnp.linspace(0.0, 2 * jnp.pi, PEAK_GRID, endpoint=False))).max()
-    return f.scale(jnp.minimum(1.0, amplitude / jnp.maximum(peak, EPS)))
 
 
 def latin_hypercube(key: Key, lower: PyTree, upper: PyTree, n: int) -> PyTree:
@@ -87,10 +71,12 @@ def log_expected_improvement(mu: Scalar, sigma: Scalar, y_best: Scalar) -> Scala
     return jnp.log(sigma) + jnp.where(upper, log_h1, jnp.where(lower, log_h3, log_h2))
 
 
-def negative_log_ei(f: Profile, surrogate: GaussianProcess, amplitude: Scalar) -> Scalar:
-    """Score a candidate as the peak-limited profile the controller will apply."""
-    mu, cov = surrogate.predict(limit_peak(f, amplitude))
-    return -log_expected_improvement(mu.squeeze(), cov.squeeze() ** 0.5, surrogate.ys.min())
+def negative_log_ei(
+    f: Profile, surrogate: GaussianProcess, embed: Callable[[Profile], Array], y_best: Scalar
+) -> Scalar:
+    """Improvement over y_best, the lowest posterior mean among observed profiles (measurements are noisy)."""
+    mu, cov = surrogate.predict(embed(f))
+    return -log_expected_improvement(mu.squeeze(), cov.squeeze() ** 0.5, y_best)
 
 
 # endregion

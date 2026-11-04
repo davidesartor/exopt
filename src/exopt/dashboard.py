@@ -2,9 +2,9 @@
 
 from typing import NamedTuple, cast
 from collections import deque
+from functools import partial
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 import argparse
 import math
@@ -13,12 +13,13 @@ import threading
 import time
 import webbrowser
 
-from exopt import MAX_TORQUE, kernels, link, trials
-from exopt.profiles import ATOM_KERNEL, Profile
+from exopt import MAX_TORQUE, link, trials
+from exopt.profiles import EMBEDDINGS, Profile, atom
 
 LIVE_WINDOW = 15.0  # [s] of leg traces shown
 TORQUE_WINDOW = 4.0  # [s] of live torque overlaid on the applied profile
 LIVE_STRIDE = 3  # plot every 3rd sample of the traces, so a refresh stays cheap
+REFRESH_MS = 100  # live band refresh period (10 Hz)
 STALE_AFTER = 2.0  # [s] without samples before the stream counts as lost
 POWER_BINS = 32
 PHASE = np.linspace(0.0, 2 * math.pi, 241)
@@ -82,13 +83,30 @@ def gait_period(s: dict[str, np.ndarray]) -> float | None:
     return float(np.median(np.diff(wraps))) if len(wraps) >= 3 else None
 
 
-def running_estimate(samples: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Running loss estimate and its iid standard error, as the stopping rule sees it."""
+def running_estimate(samples: dict[str, np.ndarray], points: int = 200) -> tuple[np.ndarray, ...]:
+    """Running loss estimate and its SE, as the stopping rule sees it (trials.standard_error, vectorized).
+
+    Evaluated at most at `points` sample counts (always including the last), so a refresh stays cheap.
+    """
     power = trials.penalized_power(samples)
-    n = np.arange(1, len(power) + 1)
-    mean = np.cumsum(power) / n
-    var = np.maximum(np.cumsum(power**2) / n - mean**2, 0.0) * n / np.maximum(n - 1, 1)
-    return -mean, np.sqrt(var / n)
+    counts = np.unique(np.linspace(2, len(power), points).astype(int))
+    sums = np.concatenate([[0.0], np.cumsum(power)])
+    squares = np.concatenate([[0.0], np.cumsum(power**2)])
+    mean = sums[counts] / counts
+
+    # few samples: plain standard error
+    variance = np.maximum(squares[counts] - counts * mean**2, 0.0) / (counts - 1)
+    se = np.sqrt(variance / counts)
+
+    # otherwise batch means, split as np.array_split does: the first n % B batches one sample longer
+    batches = trials.BATCHES
+    q, r = np.divmod(counts[:, None], batches)
+    j = np.arange(batches + 1)
+    edges = j * q + np.minimum(j, r)
+    batch_means = (sums[edges[:, 1:]] - sums[edges[:, :-1]]) / np.maximum(np.diff(edges, axis=1), 1)
+    batched = batch_means.std(axis=1, ddof=1) / np.sqrt(batches)
+    se = np.where(counts >= 2 * batches, batched, se)
+    return counts - 1, -mean, se
 
 
 def leg_power(samples: dict[str, np.ndarray], leg: int) -> np.ndarray:
@@ -100,28 +118,29 @@ def cached(function):
     """Memoize on the history's (index, loss) pairs: trials themselves are not hashable."""
     memo = {}
 
-    def wrapper(history: list[trials.Trial]):
-        key = tuple((t.index, t.loss) for t in history)
+    def wrapper(history: list[trials.Trial], *args):
+        key = (tuple((t.index, t.loss) for t in history), args)
         if key not in memo:
             memo.clear()
-            memo[key] = function(history)
+            memo[key] = function(history, *args)
         return memo[key]
 
     return wrapper
 
 
 @cached
-def surrogate_check(history: list[trials.Trial]) -> dict | None:
+def surrogate_check(history: list[trials.Trial], mode: str) -> dict | None:
     """The BO surrogate's held-out prediction of every trial."""
     if len(history) < 3:
         return None
     import jax.numpy as jnp
     from exopt.gaussian_process import GaussianProcess
 
-    gp = GaussianProcess.fit(Profile.stack([t.profile for t in history]), jnp.array([t.loss for t in history]))
+    xs = EMBEDDINGS[mode](Profile.stack([t.profile for t in history]))
+    gp = GaussianProcess.fit(xs, jnp.array([t.loss for t in history]), jnp.array([t.se for t in history]) ** 2)
     mean, sd = gp.leave_one_out()
     return dict(mean=np.asarray(mean), sd=np.asarray(sd), lengthscale=float(gp.lengthscale),
-                signal_sd=math.sqrt(gp.nu), noise_sd=math.sqrt(gp.nu * gp.nugget))
+                signal_sd=math.sqrt(gp.signal), nugget_sd=math.sqrt(gp.nugget))
 
 
 @cached
@@ -144,18 +163,24 @@ def profile_map(history: list[trials.Trial]) -> np.ndarray | None:
 # region Figures
 
 
-def styled(p: Palette, fig: go.Figure, title: str | None = None, height: int = 300, **layout) -> go.Figure:
-    axis = dict(gridcolor=p.grid, linecolor=p.axis, zerolinecolor=p.axis, tickcolor=p.axis, title_font_size=12)
-    fig.update_xaxes(**axis)
-    fig.update_yaxes(**axis)
-    return fig.update_layout(
+def axis_style(p: Palette) -> dict:
+    return dict(gridcolor=p.grid, linecolor=p.axis, zerolinecolor=p.axis, tickcolor=p.axis, title_font_size=12)
+
+
+def layout_style(p: Palette, title: str | None = None, height: int = 300) -> dict:
+    return dict(
         height=height, uirevision="keep", paper_bgcolor=p.surface, plot_bgcolor=p.surface,
         title=dict(text=title, x=0, font=dict(size=14, color=p.ink)) if title else None,
         font=dict(family=FONT, size=12, color=p.ink_2), margin=dict(l=56, r=16, t=44 if title else 16, b=44),
         hoverlabel=dict(bgcolor=p.surface, bordercolor=p.axis, font=dict(family=FONT, color=p.ink)),
         legend=dict(orientation="h", x=0, y=1.0, yanchor="bottom", bgcolor="rgba(0,0,0,0)"),
-        **layout,
     )
+
+
+def styled(p: Palette, fig: go.Figure, title: str | None = None, height: int = 300, **layout) -> go.Figure:
+    fig.update_xaxes(**axis_style(p))
+    fig.update_yaxes(**axis_style(p))
+    return fig.update_layout(**layout_style(p, title, height), **layout)
 
 
 def placeholder(p: Palette, message: str, title: str | None = None, height: int = 300) -> go.Figure:
@@ -200,8 +225,8 @@ def profile_figure(
                         marker=dict(size=3.5, color=p.legs[leg], opacity=0.45))
     if profile is not None and atoms:
         for k, (c, w) in enumerate(zip(np.asarray(profile.centers), np.asarray(profile.weights))):
-            atom = MAX_TORQUE * w * np.asarray(kernels.periodic(ATOM_KERNEL, profile.rho, PHASE - c))
-            fig.add_scatter(x=PHASE_CYCLES, y=atom, mode="lines", name="atoms", legendgroup="atoms",
+            atom_torque = MAX_TORQUE * w * np.asarray(atom(profile.rho, PHASE - c))
+            fig.add_scatter(x=PHASE_CYCLES, y=atom_torque, mode="lines", name="atoms", legendgroup="atoms",
                             showlegend=k == 0, line=dict(color=p.muted, width=1.5, dash="dash"),
                             hovertemplate=f"atom {k + 1}: center {cycles(c):.2f}, weight {w:+.3f}<extra></extra>")
     if profile is not None:
@@ -212,41 +237,60 @@ def profile_figure(
     return styled(p, phase_axis(fig), title)
 
 
-def estimate_figure(title: str, samples: dict, tol: float | None = None, p: Palette = LIGHT) -> go.Figure:
-    """Running loss estimate of a segment with its ±2 SE band."""
+def estimate_figure(title: str, samples: dict, rule: dict | None = None, p: Palette = LIGHT) -> go.Figure:
+    """Running loss estimate of a segment with its ±2 SE band, against the stop threshold if any."""
     if len(samples.get("time", [])) < 2:
-        return placeholder(p, "waiting for blended samples", title)
-    loss, se = running_estimate(samples)
-    t = samples["time"] - samples["time"][0]
+        return placeholder(p, "waiting for full-gain samples", title)
+    at, loss, se = running_estimate(samples)
+    t = samples["time"][at] - samples["time"][0]
     fig = go.Figure()
     fig.add_scatter(x=np.concatenate([t, t[::-1]]), y=np.concatenate([loss + 2 * se, (loss - 2 * se)[::-1]]),
-                    fill="toself", fillcolor=p.band, line=dict(width=0), name="±2 SE (iid)", hoverinfo="skip")
+                    fill="toself", fillcolor=p.band, line=dict(width=0), name="±2 SE", hoverinfo="skip")
     fig.add_scatter(x=t, y=loss, mode="lines", name="estimate", line=dict(color=p.accent, width=2), customdata=se,
                     hovertemplate="%{x:.1f} s<br>loss %{y:.3f} ± %{customdata:.3f}<extra></extra>")
-    if tol is not None:
-        note(p, fig, f"relative SE {100 * se[-1] / max(abs(loss[-1]), 1.0):.1f}% (stops below {100 * tol:.0f}%)")
+    if rule is not None:
+        # the segment stops once its estimate crosses best + z * sqrt(se^2 + sd_best^2)
+        best, sd, z = rule["best_mean"], rule["best_sd"], rule["z"]
+        fig.add_scatter(x=t, y=np.full_like(t, best), mode="lines", name="best (posterior)",
+                        line=dict(color=p.muted, width=1.5, dash="dash"), hoverinfo="skip")
+        fig.add_scatter(x=t, y=best + z * np.hypot(se, sd), mode="lines", name=f"stop above ({z:g} sd)",
+                        line=dict(color=p.legs[1], width=1.5, dash="dot"), hoverinfo="skip")
+        note(p, fig, f"{(loss[-1] - best) / np.hypot(se[-1], sd):.1f} sd above the best (stops above {z:g})")
     fig.update_xaxes(title_text="time in segment (s)")
     fig.update_yaxes(title_text="loss")
     return styled(p, fig, title)
 
 
-def live_figure(s: dict[str, np.ndarray], p: Palette = LIGHT) -> go.Figure:
-    """Position, velocity, torque and estimated phase of both legs."""
+def live_figure(s: dict[str, np.ndarray], p: Palette = LIGHT) -> go.Figure | dict:
+    """Position, velocity, torque and estimated phase of both legs.
+
+    Built as a plain dict: plotly's validation of a four-row figure costs more than the 10 Hz refresh allows.
+    """
     if not s:
         return placeholder(p, "no samples from the controller", height=420)
     rows = [("position", "rad"), ("velocity", "rad/s"), ("torque", "Nm"), ("phase", "cycles")]
-    fig = make_subplots(rows=len(rows), cols=1, shared_xaxes=True, vertical_spacing=0.04)
+    t, gap = s["time"][::LIVE_STRIDE].tolist(), 0.04
+    height = (1 - gap * (len(rows) - 1)) / len(rows)
+    data, layout = [], layout_style(p, height=420)
     for row, (kind, unit) in enumerate(rows, 1):
+        suffix = "" if row == 1 else str(row)
         for leg in (0, 1):
             y = s[f"{kind}_{leg}"][::LIVE_STRIDE]
-            fig.add_scatter(
-                x=s["time"][::LIVE_STRIDE], y=cycles(y) if kind == "phase" else y, row=row, col=1,
-                mode="markers" if kind == "phase" else "lines", name=f"leg {leg}", legendgroup=f"leg {leg}",
-                showlegend=row == 1, line=dict(color=p.legs[leg], width=1.5), marker=dict(color=p.legs[leg], size=2),
-            )
-        fig.update_yaxes(title_text=f"{kind} ({unit})", row=row, col=1)
-    fig.update_xaxes(title_text="controller time (s)", row=len(rows), col=1)
-    return styled(p, fig, height=420)
+            data.append(dict(
+                type="scatter", x=t, y=(cycles(y) if kind == "phase" else y).tolist(),
+                xaxis=f"x{suffix}", yaxis=f"y{suffix}", mode="markers" if kind == "phase" else "lines",
+                name=f"leg {leg}", legendgroup=f"leg {leg}", showlegend=row == 1,
+                line=dict(color=p.legs[leg], width=1.5), marker=dict(color=p.legs[leg], size=2),
+            ))
+        top = 1 - (row - 1) * (height + gap)
+        layout[f"xaxis{suffix}"] = axis_style(p) | dict(anchor=f"y{suffix}", showticklabels=row == len(rows))
+        if row > 1:
+            layout[f"xaxis{suffix}"]["matches"] = "x"
+        layout[f"yaxis{suffix}"] = axis_style(p) | dict(
+            anchor=f"x{suffix}", domain=[max(top - height, 0.0), top], title=dict(text=f"{kind} ({unit})"),
+        )
+    layout[f"xaxis{len(rows)}"]["title"] = dict(text="controller time (s)")
+    return dict(data=data, layout=layout)
 
 
 def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
@@ -255,7 +299,7 @@ def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = 
         return placeholder(p, "no trials yet", title, 320)
     index = np.array([t.index for t in history])
     loss = np.array([t.loss for t in history])
-    se = np.array([trials.standard_error(trials.penalized_power(t.samples)) for t in history])
+    se = np.array([t.se for t in history])
     best = int(loss.argmin())
     data = np.stack([index, se, [len(t.samples["time"]) for t in history]], 1)
     hover = "trial %{customdata[0]}<br>loss %{y:.3f} ± %{customdata[1]:.3f}<br>%{customdata[2]} samples<extra></extra>"
@@ -276,27 +320,31 @@ def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = 
     return styled(p, fig, title, 320)
 
 
-def surrogate_figure(history: list[trials.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
+def surrogate_figure(
+    history: list[trials.Trial], selected: int | None, p: Palette = LIGHT, mode: str = "functional"
+) -> go.Figure:
     title = "surrogate check: held-out prediction"
-    check = surrogate_check(history)
+    check = surrogate_check(history, mode)
     if check is None:
         return placeholder(p, "needs 3 trials", title, 320)
     index = np.array([t.index for t in history])
     loss, mean, sd = np.array([t.loss for t in history]), check["mean"], check["sd"]
+    se = np.array([t.se for t in history])
     span = [min(loss.min(), mean.min()), max(loss.max(), mean.max())]
 
     fig = go.Figure()
     fig.add_scatter(x=span, y=span, mode="lines", hoverinfo="skip", line=dict(color=p.axis, width=1.5, dash="dash"))
-    fig.add_scatter(x=loss, y=mean, mode="markers", customdata=np.stack([index, sd], 1),
+    fig.add_scatter(x=loss, y=mean, mode="markers", customdata=np.stack([index, sd, se], 1),
+                    error_x=dict(array=2 * se, color=p.axis, thickness=1.5, width=0),
                     error_y=dict(array=2 * sd, color=p.axis, thickness=1.5, width=0),
                     marker=dict(size=9, color=p.accent, line=dict(color=p.surface, width=2)),
-                    hovertemplate="trial %{customdata[0]}<br>observed %{x:.3f}"
+                    hovertemplate="trial %{customdata[0]}<br>observed %{x:.3f} ± %{customdata[2]:.3f}"
                                   "<br>predicted %{y:.3f} ± %{customdata[1]:.3f}<extra></extra>")
     if selected in index:
         ring(p, fig, loss[index == selected][0], mean[index == selected][0])
     note(p, fig, f"GP lengthscale {check['lengthscale']:.3g} · signal sd {check['signal_sd']:.3g}"
-              f" · noise sd {check['noise_sd']:.3g}")
-    fig.update_xaxes(title_text="observed loss")
+              f" · nugget sd {check['nugget_sd']:.3g}")
+    fig.update_xaxes(title_text="observed loss (±2 SE)")
     fig.update_yaxes(title_text="predicted without it (±2 sd)")
     return styled(p, fig, title, 320, showlegend=False)
 
@@ -372,8 +420,7 @@ def portrait_figure(trial: trials.Trial, p: Palette = LIGHT) -> go.Figure:
 
 def trial_summary(trial: trials.Trial) -> str:
     s, p = trial.samples, trial.profile
-    se = trials.standard_error(trials.penalized_power(s))
-    return (f"trial {trial.index} · loss {trial.loss:.3f} ± {se:.3f} · {len(s['time'])} samples over "
+    return (f"trial {trial.index} · loss {trial.loss:.3f} ± {trial.se:.3f} · {len(s['time'])} samples over "
             f"{s['time'][-1] - s['time'][0]:.1f} s · {p.atoms} atoms, ρ = {float(p.rho):.2f} rad")
 
 
@@ -447,16 +494,18 @@ def status_tiles(window: list[dict], s: dict, live: bool, current: dict | None, 
         else ("controller", "no stream", f"from {host}", True),
         ("gait period", f"{period:.2f} s", f"{60 / period:.0f} cycles/min", False) if period
         else ("gait period", "—", "waiting for the phase", False),
-        ("blend", f"{100 * last['blend']:.0f}%", "ramping in" if last["blend"] < 1 else "fully applied", False)
-        if last else ("blend", "—", "", False),
+        ("gain", f"{100 * last['gain']:.0f}%", "full scale" if last["gain"] >= 1 else "ramping", False)
+        if last else ("gain", "—", "", False),
     ]
 
     # the segment being collected, or the trial it just became
     if current and history and current["id"].startswith(f"{history[-1].index}-"):
         tiles.append(("segment estimate", "recorded", f"trial {history[-1].index} saved · proposing next", False))
     elif len(segment.get("time", [])) > 1:
-        loss, se = running_estimate(segment)
-        tiles.append(("segment estimate", f"{loss[-1]:.3f}", f"± {se[-1]:.3f} over {len(loss)} samples", False))
+        _, loss, se = running_estimate(segment)
+        rule = current.get("stop_rule") if current else None
+        gap = f" · {(loss[-1] - rule['best_mean']) / np.hypot(se[-1], rule['best_sd']):.1f} sd above best" if rule else ""
+        tiles.append(("segment estimate", f"{loss[-1]:.3f}", f"± {se[-1]:.3f} over {len(loss)} samples{gap}", False))
     else:
         tiles.append(("segment estimate", "—", "collecting" if current else "no profile running", False))
 
@@ -467,7 +516,7 @@ def status_tiles(window: list[dict], s: dict, live: bool, current: dict | None, 
     return tiles
 
 
-def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, tol: float):
+def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, mode: str):
     from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
     # drain the controller's sample stream into a rolling buffer from a background thread
@@ -509,7 +558,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, tol: float):
         grid("trial-profile", "trial-power", "trial-convergence", "trial-portrait"),
         dcc.Store(id="selected"),
         dcc.Store(id="theme"),
-        dcc.Interval(id="fast", interval=700),
+        dcc.Interval(id="fast", interval=REFRESH_MS),
         dcc.Interval(id="slow", interval=2500),
     ])
 
@@ -531,8 +580,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, tol: float):
         current = trials.load_current(exp_dir)
         history = trials.load(exp_dir)
 
-        # samples of the profile being collected, once blended in, after the warmup
-        segment = columns([x for x in data if current and x["profile_id"] == current["id"] and x["blend"] >= 1][warmup:])
+        # samples of the profile being collected, once at full gain, after the warmup
+        segment = columns([x for x in data if current and x["profile_id"] == current["id"] and x["gain"] >= 1][warmup:])
         recent = columns([x for x in window if x["time"] > window[-1]["time"] - TORQUE_WINDOW]) if window else None
 
         tiles = [
@@ -545,7 +594,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, tol: float):
         return (
             tiles,
             profile_figure("applied profile vs live torque", profile, recent, "torque", p=p),
-            estimate_figure("current segment: loss estimate", segment, tol, p=p),
+            estimate_figure("current segment: loss estimate", segment, current and current.get("stop_rule"), p=p),
             live_figure(s, p=p),
         )
 
@@ -584,7 +633,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, tol: float):
     )
     def refresh_optimization(_, selected, theme):
         history, p = trials.load(exp_dir), THEMES.get(theme, LIGHT)
-        figures = (loss_figure, surrogate_figure, profiles_figure, map_figure)
+        figures = (loss_figure, partial(surrogate_figure, mode=mode), profiles_figure, map_figure)
         return tuple(figure(history, selected, p=p) for figure in figures)
 
     @app.callback(
@@ -677,15 +726,15 @@ def main():
     parser.add_argument("exp_dir", nargs="?", default="experiments/mock", help="experiment folder")
     parser.add_argument("--host", default="localhost", help="controller host (tunnel endpoint)")
     parser.add_argument("--port", type=int, default=8050, help="dashboard port")
-    parser.add_argument("--warmup", type=int, default=100, help="samples dropped after a blend (as bo-loop)")
-    parser.add_argument("--tol", type=float, default=0.05, help="relative SE that ends a segment (as bo-loop)")
+    parser.add_argument("--warmup", type=int, default=100, help="samples dropped after the ramp up (as bo-loop)")
+    parser.add_argument("--mode", choices=EMBEDDINGS, default="functional", help="surrogate inputs (as bo-loop)")
     parser.add_argument("--animation", action="store_true", help="export the gait animation instead")
     parser.add_argument("--swing", type=float, default=45.0, help="animation max swing angle (deg)")
     parser.add_argument("--fps", type=float, default=25.0, help="animation frame rate")
     args = parser.parse_args()
 
     if not args.animation:
-        run_dashboard(args.exp_dir, args.host, args.port, args.warmup, args.tol)
+        run_dashboard(args.exp_dir, args.host, args.port, args.warmup, args.mode)
         return
     out = f"{args.exp_dir}/animation.html"
     animation_figure(trials.load(args.exp_dir), args.swing, args.fps).write_html(out, auto_play=False)

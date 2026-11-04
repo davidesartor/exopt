@@ -3944,7 +3944,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
     Wrapping a stationary kernel around the gait cycle, <code>k<sub>per</sub>(t) = Σ<sub>m</sub> k(t + 2πm)</code>,
     gives a periodic kernel whose Fourier coefficients are the spectral density sampled at the harmonics
     (Poisson summation): <code>k<sub>per</sub>(t) = S(0)/2π + Σ<sub>n≥1</sub> S(n)/π · cos(nt)</code>.
-    Profiles in <code>exopt</code> are sums of such atoms with the constant term dropped, and are compared by their
+    Profiles in <code>exopt</code> are sums of squared-exponential atoms, constant term kept and each scaled to a peak of 1, compared by their
     L2 distance over the cycle. Lengthscales are in radians of gait phase; one cycle is 2π.
   </p>
 
@@ -3981,7 +3981,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
         <h2>series</h2>
         <div class="field"><label for="N">harmonics kept N</label><output id="N-out"></output>
           <input type="range" id="N" min="1" max="64" step="1" value="6"></div>
-        <label class="check"><input type="checkbox" id="zeromean" checked> drop the constant term (zero-mean, as in exopt)</label>
+        <label class="check"><input type="checkbox" id="zeromean"> drop the constant term (zero-mean)</label>
       </div>
     </div>
 

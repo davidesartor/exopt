@@ -18,7 +18,7 @@ LOWPASS_SMOOTHING = 0.1  # EMA weight before the phase estimation
 CROSSING_HYSTERESIS = 0.3  # zero-crossing band, as a fraction of the position RMS
 MIN_CROSSING_BAND = 0.03  # [rad] floor of the band, so standing noise never counts as strides
 STRIDES_KEPT = 6  # recent stride periods whose median sets omega
-GAIN_RAMP_TIME = 5.0  # [s] blend from the previous profile to the new one after a swap
+GAIN_RAMP_TIME = 5.0  # [s] ramp of the profile gain between zero and full scale
 
 # simulated subject
 TRUE_GAIT_PERIOD = 1.0  # [s] one gait cycle (2 steps, 1 per leg)
@@ -199,6 +199,12 @@ class PhaseEstimator:
 # region Control Loop
 
 
+def torque_series(profile: Profile) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Harmonics and Fourier coefficients of a profile, computed once per swap so each step is plain numpy."""
+    cos, sin = (np.asarray(c) for c in profile.series())
+    return np.arange(len(cos)), cos, sin
+
+
 def per_leg(**columns: np.ndarray | None) -> dict:
     """Flatten two-leg arrays into name_0 / name_1 sample fields."""
     return {
@@ -225,9 +231,11 @@ def main():
         threading.Thread(target=lambda: (input("Press enter to start walking\n"), walking.set()), daemon=True).start()
 
     estimator = PhaseEstimator()
-    zero = Profile(jnp.zeros(1), jnp.zeros(1), jnp.asarray(1.0))
-    payload, profile, previous = dict(id=None), zero, zero
-    start = swap_at = next_tick = time.monotonic()
+    # every profile ramps up from zero and back down to zero, so each trial starts alike
+    requested, applied_id = dict(id=None), None
+    harmonics, cos, sin = torque_series(Profile(jnp.zeros(1), jnp.zeros(1), jnp.asarray(1.0)))
+    gain = 0.0
+    start = last_tick = next_tick = time.monotonic()
     stage = "standing"
     try:
         while (now := time.monotonic()) - start < 60.0 * args.duration:
@@ -239,23 +247,32 @@ def main():
                     stage = "running"
                     print(f"calibrated: gait period {2 * np.pi / estimator.omega:.3f} s")
 
-            # swap in a new profile once calibrated (republished ids are ignored)
+            # a request is a profile, or a release (id None); republished ids are ignored
             update = link.latest_message(profiles) if estimator.calibrated else None
-            if update is not None and update["id"] != payload["id"]:
-                payload, previous, profile, swap_at = update, profile, Profile.from_dict(update), now
-                print(f"profile {payload['id']}")
+            if update is not None and update["id"] != requested["id"]:
+                requested = update
+                print(f"profile {requested['id']}" if requested["id"] else "release")
 
-            # blend from the previous profile to the new one; zero torque until calibrated
-            blend = min((now - swap_at) / GAIN_RAMP_TIME, 1.0)
+            # swap profiles only at zero gain, then ramp up; ramp down on release or a new request
+            if gain == 0.0 and requested["id"] not in (None, applied_id):
+                applied_id = requested["id"]
+                harmonics, cos, sin = torque_series(Profile.from_dict(requested))
+            target = 1.0 if requested["id"] is not None and requested["id"] == applied_id else 0.0
+            step = (now - last_tick) / GAIN_RAMP_TIME
+            gain = min(gain + step, target) if gain < target else max(gain - step, target)
+            last_tick = now
+
+            # zero torque until calibrated
             phase, torque = None, np.zeros(2)
             if estimator.calibrated:
                 phase = estimator(position, velocity)
-                fraction = blend * profile(phase) + (1 - blend) * previous(phase)
-                torque = MAX_TORQUE * np.clip(np.asarray(fraction), -1.0, 1.0)
+                angle = np.outer(phase, harmonics)
+                fraction = np.cos(angle) @ cos + np.sin(angle) @ sin
+                torque = MAX_TORQUE * np.clip(gain * fraction, -1.0, 1.0)
             legs.command(torque)
 
             samples.send_json(
-                dict(time=now - start, stage=stage, profile_id=payload["id"], blend=blend)
+                dict(time=now - start, stage=stage, profile_id=applied_id, gain=gain)
                 | per_leg(
                     phase=phase,
                     position=position,

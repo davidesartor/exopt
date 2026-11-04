@@ -8,6 +8,7 @@ import numpy as np
 from exopt.profiles import Profile
 
 BETA = 5.0  # weight of negative (resistive) power in the objective
+BATCHES = 10  # batch means for the standard error
 
 
 ################################################################################
@@ -28,12 +29,17 @@ def objective(samples: dict) -> float:
     return -float(penalized_power(samples).mean())
 
 
-def standard_error(values: np.ndarray, batches: int = 10) -> float:
+def standard_error(values: np.ndarray, batches: int = BATCHES) -> float:
     """Standard error of the mean by batch means, robust to the within-cycle correlation."""
     if len(values) < 2 * batches:
         return float(np.std(values, ddof=1) / np.sqrt(len(values))) if len(values) > 1 else float("nan")
     means = np.array([b.mean() for b in np.array_split(values, batches)])
     return float(means.std(ddof=1) / np.sqrt(batches))
+
+
+def gap_to_best(power: np.ndarray, best_mean: float, best_sd: float) -> float:
+    """Standard deviations by which a segment's running loss sits above the best posterior mean."""
+    return (-float(power.mean()) - best_mean) / float(np.hypot(standard_error(power), best_sd))
 
 
 # endregion
@@ -51,7 +57,13 @@ class Trial(NamedTuple):
 
     @property
     def loss(self) -> float:
+        """Measured loss: the mean over the segment."""
         return objective(self.samples)
+
+    @property
+    def se(self) -> float:
+        """Standard error of the measured loss."""
+        return standard_error(penalized_power(self.samples))
 
 
 def save(exp_dir: str, index: int, profile: Profile, samples: list[dict]) -> Trial:
