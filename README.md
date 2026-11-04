@@ -46,9 +46,27 @@ uv run exo-controller [--mock]
 ssh -N -L 5555:localhost:5555 -L 5556:localhost:5556 user@pi &
 uv run bo-loop --exp-dir <dir> --atoms 2 --duration 30
 
-# dashboard: live leg state, BO progress, per-trial detail (or --animation)
+# dashboard: what runs now, how the optimization goes, any trial in detail (or --animation)
 uv run --group dev exo-dashboard <dir>
 ```
+
+The dashboard is one page in three bands. **Now**: status tiles (stream, gait
+period, blend, the current segment's loss estimate), the applied profile against
+the live commanded torque, the segment's running estimate with its stopping band,
+and live leg traces. **Optimization**: loss per trial (±2 SE by batch means) with
+the best so far, a held-out check of the GP surrogate (each trial predicted
+without it), every profile tried, and the trials in profile space (principal
+coordinates of the L2 distance). **Trial**: click a trial in any of those charts
+(or step through them) for its atoms against the measured torque, penalized power
+over the gait cycle per leg, the convergence of its estimate, and its phase
+portrait. The page follows the OS light/dark setting, and the header button
+toggles it. `bo-loop` writes the profile it is running to `<dir>/current.json`.
+
+`docs/periodic_kernel.html` is a standalone explorer of the periodized kernels:
+the copies being wrapped around the cycle, the truncated Fourier series against
+the exact sum, the spectrum sampled at the harmonics, and two atoms with their
+L2 inner product and distance, with sliders for the kernel family, lengthscales,
+centers, weights and truncation.
 
 The controller streams from startup; torque stays zero until the gait frequency
 is calibrated (after "start walking"). Each new profile is blended in over 5 s;
@@ -69,5 +87,7 @@ src/exopt/
   link.py               # ZMQ pub/sub link and segment collection
   bo_loop.py            # bo-loop: propose, collect, record, repeat
   controller.py         # exo-controller: phase estimation, torque, drives or simulated legs
-  dashboard.py          # exo-dashboard: live view, progress, trial detail, gait animation
+  dashboard.py          # exo-dashboard: now / optimization / trial bands, gait animation
+docs/
+  periodic_kernel.html  # interactive explorer of the periodized kernels
 ```
