@@ -9,10 +9,6 @@ RHO_RANGE = (0.3, 2.5)  # atom lengthscales [rad of gait phase]
 MAX_WEIGHT = 0.5  # atom peak torque bound, as a fraction of MAX_TORQUE
 
 
-################################################################################
-# region Profiles
-
-
 def harmonics() -> Float[Array, "n"]:
     """Harmonics 0..HARMONICS of the gait cycle."""
     return jnp.arange(HARMONICS + 1, dtype=float)
@@ -79,14 +75,6 @@ class Profile(NamedTuple):
         return jax.tree.map(lambda *leaves: jnp.stack(leaves), *(p.pad_to(k) for p in profiles))
 
 
-# endregion
-################################################################################
-
-
-################################################################################
-# region Embeddings
-
-
 def features(f: Profile) -> Float[Array, "... 2n+1"]:
     """Fourier coefficients scaled so their euclidean distance is the L2 distance over the cycle."""
     # cos(n.) and sin(n.) have squared norm pi over the cycle, the constant 2pi
@@ -108,5 +96,3 @@ def coefficients(f: Profile) -> Float[Array, "... 3"]:
 EMBEDDINGS = dict(functional=features, coefficients=coefficients)
 
 
-# endregion
-################################################################################

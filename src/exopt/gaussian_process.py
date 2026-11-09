@@ -104,9 +104,3 @@ class GaussianProcess(NamedTuple):
         # add the uncertainty of the trend estimate
         residual = 1 - gain.sum(-1, keepdims=True)
         return mean, cov + residual @ residual.T / self.C_inv_sum
-
-    def leave_one_out(self) -> tuple[Float[Array, "n"], Float[Array, "n"]]:
-        """Prediction of each measurement from all the others (fixed hyperparameters)."""
-        C_inv = jsp.linalg.cho_solve((self.C_sqrt, True), jnp.eye(len(self.ys)))
-        d = jnp.diag(C_inv)
-        return self.ys - C_inv @ (self.ys - self.b) / d, jnp.sqrt(1 / d)

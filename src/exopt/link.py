@@ -1,24 +1,46 @@
 from typing import cast
 import time
 
+import zmq.utils.monitor
+
 import numpy as np
 import zmq
 
-from exopt.trials import gap_to_best, penalized_power
+from exopt.trials import columns, gait_estimate, stop_reason
 
 SAMPLE_PORT = 5555  # controller PUB -> driver SUB, one JSON dict per control step
 PROFILE_PORT = 5556  # driver PUB -> controller SUB, one JSON dict per profile request or release
+WARMUP = 100  # samples dropped after the ramp up
+STALL = 10.0  # [s] without samples: the controller is gone
 
 
 def controller_link() -> tuple[zmq.Socket, zmq.Socket]:
     """Controller side: bind a PUB for samples out and a SUB for profile updates in."""
     ctx = zmq.Context.instance()
-    samples = ctx.socket(zmq.PUB)
+    samples, profiles = ctx.socket(zmq.PUB), ctx.socket(zmq.SUB)
+    # heartbeats drop a driver that vanished without closing (wifi, a dead tunnel), so it stops counting as a peer
+    for socket in (samples, profiles):
+        socket.setsockopt(zmq.HEARTBEAT_IVL, 1000)
+        socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, 3000)
     samples.bind(f"tcp://*:{SAMPLE_PORT}")
-    profiles = ctx.socket(zmq.SUB)
     profiles.bind(f"tcp://*:{PROFILE_PORT}")
     profiles.setsockopt_string(zmq.SUBSCRIBE, "")
     return samples, profiles
+
+
+class Peers:
+    """Connections open to bound sockets (dashboards, bo-loops), counted from their zmq monitors."""
+
+    def __init__(self, *sockets: zmq.Socket):
+        self.monitors = [s.get_monitor_socket(zmq.EVENT_ACCEPTED | zmq.EVENT_DISCONNECTED) for s in sockets]
+        self.count = 0
+
+    def __call__(self) -> int:
+        for monitor in self.monitors:
+            while monitor.poll(0):
+                event = zmq.utils.monitor.recv_monitor_message(monitor)["event"]
+                self.count += 1 if event == zmq.EVENT_ACCEPTED else -1
+        return self.count
 
 
 def driver_link(host: str = "localhost") -> tuple[zmq.Socket, zmq.Socket]:
@@ -54,45 +76,39 @@ def release(profiles: zmq.Socket) -> None:
     profiles.send_json(dict(id=None))
 
 
-def collect_segment(
-    samples: zmq.Socket,
-    profiles: zmq.Socket,
-    payload: dict,
-    warmup: int,
-    min_samples: int = 100,
-    max_samples: int = 2000,
-) -> list[dict]:
-    """Publish the profile and gather samples until it is unlikely to beat the best.
+def collect_segment(samples: zmq.Socket, profiles: zmq.Socket, payload: dict) -> tuple[list[dict], str]:
+    """Publish the profile and gather samples until payload["stop_rule"] stops it (trials.stop_reason), and why.
 
-    Warmup counts from the end of the controller's ramp up. With payload["stop_rule"]
-    (best posterior mean, sd, z) the segment ends once its running loss sits more
-    than z standard deviations above the best; otherwise it runs to max_samples.
+    WARMUP counts from the end of the controller's ramp up; valid gaits (trials.gait_slices) count after it. The segment
+    returned ends with a gait. Raises ConnectionError after STALL seconds without samples (the controller streams from
+    startup).
     """
-    collected, power = [], []
-    rule = payload.get("stop_rule")
-    published_at = None
+    collected, phase = [], None
+    rule = payload["stop_rule"]
+    published_at, heard_at = None, time.monotonic()
     while True:
         # republish every second until the profile is fully ramped up (slow-joiner losses)
         if not collected and (published_at is None or time.monotonic() - published_at > 1.0):
             profiles.send_json(payload)
             published_at = time.monotonic()
         if not samples.poll(100):
+            if time.monotonic() - heard_at > STALL:
+                raise ConnectionError(f"no samples from the controller for {STALL:g} s")
             continue
 
         # keep only samples of the requested profile, once ramped up to full gain
         sample = cast(dict, samples.recv_json())
+        heard_at = time.monotonic()
         if sample["profile_id"] != payload["id"] or sample["gain"] < 1.0:
             continue
         collected.append(sample)
-        n = len(collected) - warmup
-        if n < 1:
+        if len(collected) <= WARMUP:
             continue
 
-        # stop once the segment is confidently worse than the best (or the budget is exhausted)
-        power.append(float(penalized_power(sample)))
-        if n >= max_samples:
-            break
-        if rule and n >= min_samples:
-            if gap_to_best(np.asarray(power), rule["best_mean"], rule["best_sd"]) > rule["z"]:
-                break
-    return collected[warmup:]
+        # a gait ends where leg 0's phase wraps: check the rule on the segment up to it
+        wrapped = None not in (phase, sample["phase_0"]) and sample["phase_0"] - phase < -np.pi
+        phase = sample["phase_0"]
+        if wrapped:
+            segment = collected[WARMUP:-1]
+            if reason := stop_reason(*gait_estimate(columns(segment)), rule):
+                return segment, reason

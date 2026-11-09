@@ -1,5 +1,5 @@
 from typing import Callable
-from jaxtyping import Array, Float, Key, PyTree, Scalar
+from jaxtyping import Key, PyTree, Scalar
 
 import jax
 import jax.numpy as jnp
@@ -9,12 +9,7 @@ from jax.flatten_util import ravel_pytree
 import vlse
 
 from exopt import EPS
-from exopt.gaussian_process import GaussianProcess
 from exopt.profiles import MAX_WEIGHT, RHO_RANGE, Profile
-
-
-################################################################################
-# region Search Space
 
 
 def bounds(atoms: int) -> tuple[Profile, Profile]:
@@ -37,14 +32,6 @@ def latin_hypercube(key: Key, lower: PyTree, upper: PyTree, n: int) -> PyTree:
     cells = jax.vmap(jr.permutation, (0, None), 1)(jr.split(key_cells, len(lo)), n)
     u = (cells + jr.uniform(key_jitter, (n, len(lo)))) / n
     return jax.vmap(unravel)(lo + u * (hi - lo))
-
-
-# endregion
-################################################################################
-
-
-################################################################################
-# region Expected Improvement
 
 
 def log_expected_improvement(mu: Scalar, sigma: Scalar, y_best: Scalar) -> Scalar:
@@ -71,22 +58,6 @@ def log_expected_improvement(mu: Scalar, sigma: Scalar, y_best: Scalar) -> Scala
     return jnp.log(sigma) + jnp.where(upper, log_h1, jnp.where(lower, log_h3, log_h2))
 
 
-def negative_log_ei(
-    f: Profile, surrogate: GaussianProcess, embed: Callable[[Profile], Array], y_best: Scalar
-) -> Scalar:
-    """Improvement over y_best, the lowest posterior mean among observed profiles (measurements are noisy)."""
-    mu, cov = surrogate.predict(embed(f))
-    return -log_expected_improvement(mu.squeeze(), cov.squeeze() ** 0.5, y_best)
-
-
-# endregion
-################################################################################
-
-
-################################################################################
-# region Optimization
-
-
 def optimize_restarts(
     loss: Callable[[PyTree], Scalar],
     candidates: PyTree,
@@ -103,5 +74,3 @@ def optimize_restarts(
     return jax.tree.map(lambda a: a[jnp.argmin(results.f)], results.x)
 
 
-# endregion
-################################################################################

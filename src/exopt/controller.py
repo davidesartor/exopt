@@ -1,295 +1,262 @@
-"""exo-controller: estimate the gait phase, apply the published torque profile, stream samples."""
+"""Controller script: estimate the gait phase, apply the published torque profile to the drives, stream samples."""
 
-import jax.numpy as jnp
-import numpy as np
-
-import argparse
+import signal
 import sys
-import threading
 import time
+from typing import NamedTuple
+
+import numpy as np
+from jaxtyping import Bool, Float
 
 from exopt import MAX_TORQUE, link
 from exopt.profiles import Profile
 
 SAMPLING_STEP = 0.01  # [s] control loop period
 MIN_CALIBRATION_TIME = 10.0  # [s] minimum time to calibrate the gait frequency
-CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
-LOWPASS_SMOOTHING = 0.1  # EMA weight before the phase estimation
-CROSSING_HYSTERESIS = 0.3  # zero-crossing band, as a fraction of the position RMS
+CALIBRATION_TOL = 0.01  # relative drift of the stride frequency per second at convergence
+AFO_HARMONICS = 4  # harmonics of the trajectory the oscillator learns
+AFO_BANDWIDTH = 0.5  # [rad/s] natural frequency of the oscillator's phase-locking loop, damping 0.7
+AFO_SHAPE_TIME = 5.0  # [s] time constant of the learned trajectory
+AFO_SETTLE_TIME = 5.0  # [s] the oscillator locks after calibration before torque is allowed
+MAX_OMEGA_SLIP = 0.25  # log ratio of oscillator to stride frequency beyond which omega resets to the stride one
+RECENT_TIME = 3.0  # [s] EMA time constant of the recent position mean and spread
+CROSSING_HYSTERESIS = 0.3  # zero-crossing band, as a fraction of the recent position RMS
 MIN_CROSSING_BAND = 0.03  # [rad] floor of the band, so standing noise never counts as strides
-STRIDES_KEPT = 6  # recent stride periods whose median sets omega
-GAIN_RAMP_TIME = 5.0  # [s] ramp of the profile gain between zero and full scale
-
-# simulated subject
-TRUE_GAIT_PERIOD = 1.0  # [s] one gait cycle (2 steps, 1 per leg)
-LEG_INERTIA = 1.0  # [kg m^2] leg about the hip
-HIP_STIFFNESS = 150.0  # [Nm/rad] subject's impedance around the reference gait
-HIP_DAMPING = 5.0  # [Nm s/rad]
-SUBSTEPS = 10  # integration substeps per control step
+STRIDES_KEPT = 6  # recent stride periods whose median sets the stride frequency
+WALKING_STRIDES = 2.0  # [strides] without a crossing on either leg before the oscillators stop adapting
+STILL_SPEED = 0.15  # [rad/s] both legs slower than this count as standing still (velocity noise sd 0.03)
+STILL_TIME = 1.0  # [s] standing still before the logged positions are re-zeroed on the standing pose
+IDLE_TIMEOUT = 300.0  # [s] with nothing connected before the controller exits
+GAIN_RAMP_CYCLES = 3.0  # [gait cycles] ramp of the profile gain between zero and full scale
 
 
-################################################################################
-# region Legs
+class Estimator(NamedTuple):
+    """Gait phase from an adaptive frequency oscillator per leg, sharing one omega, guarded by a stride timer.
 
-
-class HardwareLegs:
-    """Two MD80 drives over CAN in raw torque mode, zeroed with the subject standing still."""
-
-    def __init__(self):
-        import pyCandle
-
-        input("Subject standing still: press enter to zero the position")
-        self.candle = candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
-        self.ids = candle.ping()[:2]
-        if len(self.ids) < 2:
-            sys.exit(f"expected 2 motors, found {len(self.ids)}")
-        for id in self.ids:
-            candle.addMd80(id)
-        for id, md in zip(self.ids, candle.md80s):
-            if not candle.controlMd80SetEncoderZero(id):
-                sys.exit(f"failed to zero encoder on drive {id}")
-            if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE):
-                sys.exit(f"failed to set mode on drive {id}")
-            if not candle.controlMd80Enable(id, True):
-                sys.exit(f"failed to enable drive {id}")
-            md.setMaxTorque(MAX_TORQUE)
-        candle.begin()
-
-    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Positions [rad], velocities [rad/s] and measured torques [Nm] of both legs."""
-        mds = self.candle.md80s
-        return (
-            np.array([md.getPosition() for md in mds]),
-            np.array([md.getVelocity() for md in mds]),
-            np.array([md.getTorque() for md in mds]),
-        )
-
-    def command(self, torque: np.ndarray) -> None:
-        for md, tau in zip(self.candle.md80s, torque):
-            md.setTargetTorque(float(tau))
-
-    def close(self) -> None:
-        """Leave the motors unpowered."""
-        self.command(np.zeros(2))
-        self.candle.end()
-        for id in self.ids:
-            self.candle.controlMd80Enable(id, False)
-
-
-class SimulatedLegs:
-    """Legs following a reference gait through a hip impedance: I e'' + c e' + k e = torque."""
-
-    def __init__(self):
-        self.start = self.last_read = time.monotonic()
-        self.deviation = self.deviation_rate = self.torque = np.zeros(2)
-
-    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        now = time.monotonic()
-
-        # the legs respond to the torque applied since the last read (stalls capped)
-        dt = min(now - self.last_read, 5 * SAMPLING_STEP) / SUBSTEPS
-        self.last_read = now
-        for _ in range(SUBSTEPS):
-            restoring = HIP_DAMPING * self.deviation_rate + HIP_STIFFNESS * self.deviation
-            self.deviation_rate = self.deviation_rate + dt * (self.torque - restoring) / LEG_INERTIA
-            self.deviation = self.deviation + dt * self.deviation_rate
-
-        # hip-like reference: dominant fundamental plus an asymmetric second harmonic
-        omega = 2 * np.pi / TRUE_GAIT_PERIOD
-        phase = omega * (now - self.start) + np.array([0.0, np.pi])
-        position = 0.5 * np.cos(phase) + 0.1 * np.sin(2 * phase + 0.5)
-        velocity = omega * (-0.5 * np.sin(phase) + 0.2 * np.cos(2 * phase + 0.5))
-        return position + self.deviation, velocity + self.deviation_rate, self.torque
-
-    def command(self, torque: np.ndarray) -> None:
-        self.torque = torque
-
-    def close(self) -> None:
-        pass
-
-
-# endregion
-################################################################################
-
-
-################################################################################
-# region Phase Estimation
-
-
-def ema_response(smoothing: float, omega: float) -> complex:
-    """Frequency response of the per-step EMA y += smoothing * (x - y) at omega [rad/s]."""
-    return smoothing / (1 - (1 - smoothing) * np.exp(-1j * omega * SAMPLING_STEP))
-
-
-class PhaseEstimator:
-    """Gait phase arctan2(-v/omega, x), with omega from position zero crossings calibrated until stable.
-
-    The filters' mean phase lag at the calibrated omega is subtracted from the estimate.
+    Each oscillator learns its leg's trajectory as a Fourier series in its phase, the fundamental pinned to a
+    cosine (x ~ cos(phase)). Strides timed by zero crossings start the oscillators, pause their adaptation
+    while the subject stands, and reset omega if it slips away (lost lock, subharmonic).
     """
 
-    def __init__(self):
-        self.calibrated = False
-        self.n, self.offset, self.sum_sq_position = 0, np.zeros(2), 0.0
-        self.below, self.rising_at = np.zeros(2, bool), ([], [])
-        self.omega = self.checked_omega = self.started_at = self.checked_at = None
+    # stride timer
+    started_at: float | None = None
+    recent_mean: Float[np.ndarray, "2"] | None = None
+    recent_sq: Float[np.ndarray, "2"] = np.zeros(2)
+    below: Bool[np.ndarray, "2"] = np.zeros(2, bool)
+    rising_at: tuple[tuple[float, ...], tuple[float, ...]] = ((), ())
+    stride_omega: float | None = None
+    walking: bool = False
+    resumed: bool = False
 
-    def calibrate(self, now: float, position: np.ndarray, velocity: np.ndarray) -> None:
-        """Time the strides from rising zero crossings; calibrated once omega drifts < tol per second."""
-        if self.started_at is None:
-            self.started_at = self.checked_at = now
+    # calibration
+    checked_at: float | None = None
+    checked_omega: float | None = None
 
-        # center position on its running mean (the encoder zero is unreliable)
-        self.n += 1
-        self.offset = self.offset + (position - self.offset) / self.n
-        centered = position - self.offset
-        self.sum_sq_position += float(np.sum(centered**2))
-
-        # rising zero crossings with hysteresis keep the fundamental, unlike <v^2>/<x^2>
-        band = max(CROSSING_HYSTERESIS * (self.sum_sq_position / (2 * self.n)) ** 0.5, MIN_CROSSING_BAND)
-        for leg in (0, 1):
-            if centered[leg] < -band:
-                self.below[leg] = True
-            elif centered[leg] > band and self.below[leg]:
-                self.below[leg] = False
-                self.rising_at[leg].append(now)
-                del self.rising_at[leg][:-STRIDES_KEPT - 1]
-
-        # median of the recent stride periods, so the start of walking is forgotten
-        if all(len(times) > STRIDES_KEPT for times in self.rising_at):
-            period = np.median([np.diff(times) for times in self.rising_at])
-            self.omega = 2 * np.pi / period
-
-        # once per second, check the drift of the estimate
-        if now - self.checked_at < 1.0:
-            return
-        settled = self.omega is not None and self.checked_omega is not None
-        drift = abs(self.omega - self.checked_omega) / self.omega if settled else np.inf
-        self.checked_omega, self.checked_at = self.omega, now
-        if now - self.started_at >= MIN_CALIBRATION_TIME and drift < CALIBRATION_TOL:
-            self.calibrated = True
-            # offset EMA with an effective sample size of one gait cycle
-            self.offset_smoothing = SAMPLING_STEP * self.omega / (2 * np.pi)
-            self.smooth_position, self.smooth_velocity = position - self.offset, velocity
-
-            # mean lag of the estimate on a sinusoid through the centering and lowpass filters
-            lowpass = ema_response(LOWPASS_SMOOTHING, self.omega)
-            centered = lowpass * (1 - ema_response(self.offset_smoothing, self.omega))
-            cycle = np.exp(1j * np.linspace(0.0, 2 * np.pi, 256, endpoint=False))
-            estimate = (centered * cycle).real + 1j * (-1j * lowpass * cycle).real
-            self.lag = float(np.angle(np.mean(estimate / np.abs(estimate) * cycle.conj())))
-
-    def __call__(self, position: np.ndarray, velocity: np.ndarray) -> np.ndarray:
-        """Phase [rad] of both legs from the lowpassed, centered state."""
-        self.offset = self.offset + self.offset_smoothing * (position - self.offset)
-        self.smooth_position = self.smooth_position + LOWPASS_SMOOTHING * (
-            position - self.offset - self.smooth_position
-        )
-        self.smooth_velocity = self.smooth_velocity + LOWPASS_SMOOTHING * (
-            velocity - self.smooth_velocity
-        )
-        phase = np.arctan2(-self.smooth_velocity / self.omega, self.smooth_position)
-        return np.angle(np.exp(1j * (phase - self.lag)))
+    # oscillators, once calibrated
+    locked_at: float | None = None
+    omega: float | None = None
+    phase: Float[np.ndarray, "2"] | None = None
+    cos_coefficients: Float[np.ndarray, "2 H"] | None = None
+    sin_coefficients: Float[np.ndarray, "2 H"] | None = None
 
 
-# endregion
-################################################################################
+def time_strides(estimator: Estimator, now: float, position: Float[np.ndarray, "2"]) -> Estimator:
+    """Stride frequency from the median period between rising zero crossings around the recent mean."""
+    if estimator.recent_mean is None:
+        estimator = estimator._replace(started_at=now, checked_at=now, recent_mean=position)
+    recent = SAMPLING_STEP / RECENT_TIME
+    recent_mean = estimator.recent_mean + recent * (position - estimator.recent_mean)
+    recent_sq = estimator.recent_sq + recent * ((position - recent_mean) ** 2 - estimator.recent_sq)
+
+    # rising crossings with hysteresis keep the fundamental, unlike <v^2>/<x^2>
+    centered = position - recent_mean
+    band = max(CROSSING_HYSTERESIS * float(np.mean(recent_sq)) ** 0.5, MIN_CROSSING_BAND)
+    rising = estimator.below & (centered > band)
+    below = (centered < -band) | (estimator.below & ~rising)
+    rising_at = tuple(
+        (times + (now,))[-STRIDES_KEPT - 1:] if rose else times for times, rose in zip(estimator.rising_at, rising)
+    )
+
+    stride_omega = estimator.stride_omega
+    if all(len(times) > STRIDES_KEPT for times in rising_at):
+        stride_omega = 2 * np.pi / np.median([np.diff(times) for times in rising_at])
+    walking = stride_omega is not None and all(
+        now - times[-1] < WALKING_STRIDES * 2 * np.pi / stride_omega for times in rising_at
+    )
+    return estimator._replace(
+        recent_mean=recent_mean, recent_sq=recent_sq, below=below, rising_at=rising_at,
+        stride_omega=stride_omega, walking=walking, resumed=walking and not estimator.walking,
+    )
 
 
-################################################################################
-# region Control Loop
+def calibrate(
+    estimator: Estimator, now: float, position: Float[np.ndarray, "2"], velocity: Float[np.ndarray, "2"]
+) -> Estimator:
+    """Once the stride frequency drifts < tol per second, start the oscillators on the recent sinusoid."""
+    if now - estimator.checked_at < 1.0:
+        return estimator
+    settled = estimator.stride_omega is not None and estimator.checked_omega is not None
+    drift = abs(estimator.stride_omega - estimator.checked_omega) / estimator.stride_omega if settled else np.inf
+    estimator = estimator._replace(checked_omega=estimator.stride_omega, checked_at=now)
+    if now - estimator.started_at < MIN_CALIBRATION_TIME or drift >= CALIBRATION_TOL:
+        return estimator
+
+    omega = estimator.stride_omega
+    fundamental = np.sqrt(2 * estimator.recent_sq)
+    return estimator._replace(
+        locked_at=now,
+        omega=omega,
+        phase=np.arctan2(-velocity / omega, position - estimator.recent_mean),
+        cos_coefficients=np.column_stack([estimator.recent_mean, fundamental, np.zeros((2, AFO_HARMONICS - 1))]),
+        sin_coefficients=np.zeros((2, AFO_HARMONICS + 1)),
+    )
 
 
-def torque_series(profile: Profile) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Harmonics and Fourier coefficients of a profile, computed once per swap so each step is plain numpy."""
-    cos, sin = (np.asarray(c) for c in profile.series())
-    return np.arange(len(cos)), cos, sin
+def advance_oscillators(
+    estimator: Estimator, position: Float[np.ndarray, "2"], velocity: Float[np.ndarray, "2"]
+) -> Estimator:
+    """Advance the oscillators one step; they adapt only while walking, and run free otherwise."""
+    cos_coefficients, sin_coefficients = estimator.cos_coefficients, estimator.sin_coefficients
+
+    # back from a stop, restart the phase on the learned walking mean, as at calibration
+    phase = estimator.phase
+    if estimator.resumed:
+        phase = np.arctan2(-velocity / estimator.omega, position - cos_coefficients[:, 0])
+    omega = estimator.omega
+    if estimator.walking and abs(np.log(omega / estimator.stride_omega)) > MAX_OMEGA_SLIP:
+        omega = estimator.stride_omega
+
+    harmonics = np.arange(AFO_HARMONICS + 1)
+    cos, sin = np.cos(np.outer(phase, harmonics)), np.sin(np.outer(phase, harmonics))
+    error = estimator.walking * (position - np.sum(cos_coefficients * cos + sin_coefficients * sin, axis=1))
+
+    # phase-locking loop: error along the trajectory's slope, normalized so the loop gain ignores the amplitude
+    slope = np.sum(harmonics * (sin_coefficients * cos - cos_coefficients * sin), axis=1)
+    mean_sq_slope = 0.5 * np.sum(harmonics**2 * (cos_coefficients**2 + sin_coefficients**2), axis=1)
+    phase_error = error * slope / np.maximum(mean_sq_slope, MIN_CROSSING_BAND**2)
+    phase = np.angle(np.exp(1j * (phase + SAMPLING_STEP * (omega + 1.4 * AFO_BANDWIDTH * phase_error))))
+    omega = omega + SAMPLING_STEP * AFO_BANDWIDTH**2 * float(np.mean(phase_error))
+
+    # learn the trajectory by gradient steps on the squared error; the fundamental stays a positive cosine
+    learning_rate = 2 * SAMPLING_STEP / AFO_SHAPE_TIME
+    cos_coefficients = cos_coefficients + learning_rate * error[:, None] * cos
+    sin_coefficients = sin_coefficients + learning_rate * error[:, None] * sin
+    cos_coefficients[:, 1] = np.maximum(cos_coefficients[:, 1], MIN_CROSSING_BAND)
+    sin_coefficients[:, 1] = 0.0
+    return estimator._replace(
+        phase=phase, omega=omega, cos_coefficients=cos_coefficients, sin_coefficients=sin_coefficients
+    )
 
 
-def per_leg(**columns: np.ndarray | None) -> dict:
-    """Flatten two-leg arrays into name_0 / name_1 sample fields."""
-    return {
-        f"{name}_{leg}": None if values is None else float(values[leg])
-        for name, values in columns.items()
-        for leg in (0, 1)
-    }
+def estimate_phase(
+    estimator: Estimator, now: float, position: Float[np.ndarray, "2"], velocity: Float[np.ndarray, "2"]
+) -> tuple[Estimator, Float[np.ndarray, "2"] | None]:
+    """Phase [rad] of both legs, or None while calibrating and settling."""
+    estimator = time_strides(estimator, now, position)
+    if estimator.omega is None:
+        return calibrate(estimator, now, position, velocity), None
+    estimator = advance_oscillators(estimator, position, velocity)
+    return estimator, estimator.phase if now - estimator.locked_at >= AFO_SETTLE_TIME else None
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mock", action="store_true", help="simulated legs instead of the drives")
-    parser.add_argument("--duration", type=float, default=30.0, help="experiment time [min]")
-    args = parser.parse_args()
+if __name__ == "__main__":
+    import pyCandle
 
+    # two MD80 drives over CAN in raw torque mode
+    candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
+    ids = candle.ping()[:2]
+    if len(ids) < 2:
+        sys.exit(f"expected 2 motors, found {len(ids)}")
+    for id in ids:
+        candle.addMd80(id)
+    for id, md in zip(ids, candle.md80s):
+        if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE):
+            sys.exit(f"failed to set mode on drive {id}")
+        if not candle.controlMd80Enable(id, True):
+            sys.exit(f"failed to enable drive {id}")
+        md.setMaxTorque(MAX_TORQUE)
+    candle.begin()
+
+    # a dropped ssh session ends the run like ctrl-c, so the drives are released
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.default_int_handler)
     samples, profiles = link.controller_link()
-    legs = SimulatedLegs() if args.mock else HardwareLegs()
+    peers = link.Peers(samples, profiles)
 
-    # stream from now on; calibration starts once the subject walks
-    walking = threading.Event()
-    if args.mock:
-        walking.set()
-    else:
-        threading.Thread(target=lambda: (input("Press enter to start walking\n"), walking.set()), daemon=True).start()
-
-    estimator = PhaseEstimator()
+    estimator = Estimator()
     # every profile ramps up from zero and back down to zero, so each trial starts alike
-    requested, applied_id = dict(id=None), None
-    harmonics, cos, sin = torque_series(Profile(jnp.zeros(1), jnp.zeros(1), jnp.asarray(1.0)))
-    gain = 0.0
-    start = last_tick = next_tick = time.monotonic()
-    stage = "standing"
-    try:
-        while (now := time.monotonic()) - start < 60.0 * args.duration:
-            position, velocity, measured_torque = legs.read()
-            if walking.is_set() and not estimator.calibrated:
-                stage = "calibrating"
-                estimator.calibrate(now, position, velocity)
-                if estimator.calibrated:
-                    stage = "running"
-                    print(f"calibrated: gait period {2 * np.pi / estimator.omega:.3f} s")
+    requested, applied_id, gain = dict(id=None), None, 0.0
+    harmonics, cos, sin = np.arange(1), np.zeros(1), np.zeros(1)
+    start = last_tick = next_tick = idle_since = still_since = time.monotonic()
+    standing_pose = None
+    stage = None
 
-            # a request is a profile, or a release (id None); republished ids are ignored
-            update = link.latest_message(profiles) if estimator.calibrated else None
+    # stream samples and apply the requested profiles until ctrl-c, or IDLE_TIMEOUT with nothing connected
+    try:
+        while True:
+            now = time.monotonic()
+            if peers():
+                idle_since = now
+            elif now - idle_since > IDLE_TIMEOUT:
+                print(f"nothing connected for {IDLE_TIMEOUT / 60:g} min: exiting")
+                break
+            raw_position = np.array([md.getPosition() for md in candle.md80s])
+            velocity = np.array([md.getVelocity() for md in candle.md80s])
+            measured_torque = np.array([md.getTorque() for md in candle.md80s])
+
+            # logged positions are zeroed on the standing pose, re-taken whenever the subject stands still
+            if np.any(np.abs(velocity) > STILL_SPEED):
+                still_since = now
+            if standing_pose is None or now - still_since >= STILL_TIME:
+                standing_pose = raw_position
+            position = raw_position - standing_pose
+
+            # calibration starts by itself once strides show up; a stop ramps the torque down until walking resumes
+            estimator, phase = estimate_phase(estimator, now, raw_position, velocity)
+            previous_stage = stage
+            stage = "standing" if not estimator.walking else "running" if phase is not None else "calibrating"
+            if stage != previous_stage:
+                print(f"running: gait period {2 * np.pi / estimator.omega:.3f} s" if stage == "running" else stage)
+
+            # a request is a profile, or a release (id None); republished ids are ignored; none before calibration
+            update = link.latest_message(profiles) if phase is not None else None
             if update is not None and update["id"] != requested["id"]:
                 requested = update
                 print(f"profile {requested['id']}" if requested["id"] else "release")
 
-            # swap profiles only at zero gain, then ramp up; ramp down on release or a new request
+            # swap profiles only at zero gain, then ramp up; ramp down on release, a new request or a stop
             if gain == 0.0 and requested["id"] not in (None, applied_id):
                 applied_id = requested["id"]
-                harmonics, cos, sin = torque_series(Profile.from_dict(requested))
-            target = 1.0 if requested["id"] is not None and requested["id"] == applied_id else 0.0
-            step = (now - last_tick) / GAIN_RAMP_TIME
+                cos, sin = (np.asarray(c) for c in Profile.from_dict(requested).series())
+                harmonics = np.arange(len(cos))
+            applying = requested["id"] is not None and requested["id"] == applied_id and stage == "running"
+            target = 1.0 if applying else 0.0
+            step = (now - last_tick) * estimator.omega / (2 * np.pi * GAIN_RAMP_CYCLES) if phase is not None else 0.0
             gain = min(gain + step, target) if gain < target else max(gain - step, target)
             last_tick = now
 
             # zero torque until calibrated
-            phase, torque = None, np.zeros(2)
-            if estimator.calibrated:
-                phase = estimator(position, velocity)
+            torque = np.zeros(2)
+            if phase is not None:
                 angle = np.outer(phase, harmonics)
-                fraction = np.cos(angle) @ cos + np.sin(angle) @ sin
-                torque = MAX_TORQUE * np.clip(gain * fraction, -1.0, 1.0)
-            legs.command(torque)
+                torque = MAX_TORQUE * np.clip(gain * (np.cos(angle) @ cos + np.sin(angle) @ sin), -1.0, 1.0)
+            for md, leg_torque in zip(candle.md80s, torque):
+                md.setTargetTorque(float(leg_torque))
 
+            columns = dict(phase=phase, position=position, velocity=velocity, torque=torque,
+                           measured_torque=measured_torque)
             samples.send_json(
                 dict(time=now - start, stage=stage, profile_id=applied_id, gain=gain)
-                | per_leg(
-                    phase=phase,
-                    position=position,
-                    velocity=velocity,
-                    torque=torque,
-                    measured_torque=measured_torque,
-                )
+                | {f"{name}_{leg}": None if values is None else float(values[leg])
+                   for name, values in columns.items() for leg in (0, 1)}
             )
             next_tick = max(next_tick + SAMPLING_STEP, time.monotonic())
             time.sleep(max(next_tick - time.monotonic(), 0.0))
+
+    # leave the motors unpowered, however the run ends
     finally:
-        legs.close()
-
-
-# endregion
-################################################################################
-
-
-if __name__ == "__main__":
-    main()
+        for md in candle.md80s:
+            md.setTargetTorque(0.0)
+        candle.end()
+        for id in ids:
+            candle.controlMd80Enable(id, False)

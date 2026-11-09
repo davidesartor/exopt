@@ -9,13 +9,14 @@ dependencies = [
     "jaxtyping>=0.3.11",
     "jaxvlse>=0.1.3",
     "numpy>=2.3",
+    "plotly>=6.9.0",
     "pyzmq>=27.1.0",
 ]
 
 [project.scripts]
-exo-controller = "exopt.controller:main"
 bo-loop = "exopt.bo_loop:main"
-exo-dashboard = "exopt.dashboard:main"
+start = "exopt.dashboard:main"
+exo-review = "exopt.dashboard:review_main"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,5 +25,5 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "dash>=4.4.1",
-    "plotly>=6.9.0",
+    "paramiko>=5.1.0",
 ]
