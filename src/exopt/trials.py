@@ -178,7 +178,7 @@ class Trial(NamedTuple):
 def save(exp_dir: str, index: int, profile: RBFMixture, samples: list[dict], settings: Settings) -> Trial:
     """Record a trial's profile, its power assist, and its samples, stored column-wise."""
     columns = {c: [s[c] for s in samples] for c in samples[0]}
-    path = Path(exp_dir) / f"trial_{index}.json"
+    path = Path(exp_dir) / "data" / f"trial{index}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(encode_profile(profile) | dict(power_assist=settings.power_assist, samples=columns)))
     return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()}, settings, settings.power_assist)
@@ -186,14 +186,14 @@ def save(exp_dir: str, index: int, profile: RBFMixture, samples: list[dict], set
 
 def save_current(exp_dir: str, payload: dict) -> None:
     """Record the profile being run right now (read by the dashboard)."""
-    path = Path(exp_dir) / "current.json"
+    path = Path(exp_dir) / "data" / "current.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload))
 
 
 def load_current(exp_dir: str) -> dict | None:
     """The profile being run right now, if any."""
-    path = Path(exp_dir) / "current.json"
+    path = Path(exp_dir) / "data" / "current.json"
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
