@@ -10,6 +10,7 @@ dependencies = [
     "jax>=0.10.2",
     "jaxtyping>=0.3.11",
     "numpy>=2.3",
+    "plotly>=6.9.0",
     "pyzmq>=27.1.0",
 ]
 

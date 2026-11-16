@@ -155,6 +155,7 @@ def main():
         print(f"Stopped: {error}")
     finally:
         link.release(profiles)
+        print(f"Review in {write_review(args.exp_dir)}")
 
 
 def run_session(samples, profiles, exp_dir: str, settings: trials.Settings) -> None:
