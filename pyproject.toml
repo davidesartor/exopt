@@ -14,7 +14,6 @@ dependencies = [
 ]
 
 [project.scripts]
-exo-controller = "exopt.controller:main"
 bo-loop = "exopt.bo_loop:main"
 exo-dashboard = "exopt.dashboard:main"
 
