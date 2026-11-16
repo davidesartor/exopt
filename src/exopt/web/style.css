@@ -36,7 +36,9 @@ h2 { font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacin
 .step.active .num { background: var(--tone); border-color: var(--tone); color: #fff; }
 .hero { display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap;
   padding: 22px 26px; border-radius: 14px; background: var(--tone-soft); border: 1px solid var(--tone);
-  border-left-width: 6px; margin-bottom: 16px; }
+  border-left-width: 6px; }
+.status-row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; margin-bottom: 16px; }
+@media (max-width: 900px) { .status-row { grid-template-columns: minmax(0, 1fr); } }
 .hero-text { flex: 1; min-width: 280px; }
 .eyebrow { font-size: 12px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--tone); }
 .title { font-size: 28px; font-weight: 650; letter-spacing: -.01em; margin: 4px 0 6px; }
@@ -78,11 +80,16 @@ button.danger { color: var(--err); border-color: var(--err); background: var(--s
   background: var(--ink); color: var(--surface) !important; border-color: var(--ink); }
 .segmented input { display: none; }
 
-.console { margin-top: 36px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-  padding: 10px 16px; }
-.console summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
-.log { font: 12px ui-monospace, Menlo, monospace; color: var(--ink-2); white-space: pre-wrap; margin: 10px 0;
-  max-height: 16em; overflow-y: auto; }
+.console { display: flex; flex-direction: column; gap: 8px; height: 210px; min-width: 0; padding: 10px 14px;
+  border-radius: 14px; background: #101318; border: 1px solid #2a2f38; color: #c9d1d9; }
+.console-head { font-size: 12px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; color: #8b949e;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.console-head::before { content: "$ "; color: #3fb950; }
+/* column-reverse keeps the scroll pinned to the newest line */
+.log-scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column-reverse; }
+.log { font: 12px ui-monospace, Menlo, monospace; color: #c9d1d9; white-space: pre-wrap; margin: 0; }
+.console .controls { margin: 0; }
+.console .controls span { color: #8b949e; }
 
 .landing { display: grid; place-items: center; min-height: 60vh; }
 .landing .card { width: min(100%, 520px); padding: 28px 32px; }

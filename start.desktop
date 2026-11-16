@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=exopt dashboard
+Comment=Start the exo dashboard in the browser; closing the terminal stops it
+Exec=sh -c 'exec "$(dirname "$0")/start.command"' %k
+Terminal=true

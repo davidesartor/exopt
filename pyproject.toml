@@ -10,21 +10,25 @@ dependencies = [
     "jax>=0.10.2",
     "jaxtyping>=0.3.11",
     "numpy>=2.3",
-    "plotly>=6.9.0",
     "pyzmq>=27.1.0",
 ]
 
 [project.scripts]
 bo-loop = "exopt.bo_loop:main"
-exo-dashboard = "exopt.dashboard:main"
+start = "exopt.dashboard:main"
+exo-review = "exopt.review:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = [
+controller = [
+    "pycandlemab==1.6.0 ; sys_platform == 'linux'",
+]
+optimizer = [
     "dash>=4.4.1",
+    "paramiko>=5.1.0",
     "plotly>=6.9.0",
 ]
 
