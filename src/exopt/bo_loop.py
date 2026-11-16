@@ -8,53 +8,85 @@ import jax.numpy as jnp
 import jax.random as jr
 
 import argparse
-import time
+import os
+import signal
 import uuid
 from pathlib import Path
 
-from exopt import acquisition, link, trials
-from exopt.gaussian_process import GaussianProcess
-from exopt.profiles import EMBEDDINGS, Profile
+from einops import rearrange
+from bofus import acquisition
+from bofus.gp import GaussianProcess
+from bofus.rkhs import X_MAX, RBFMixture
+from bofus.utils import latin_hypercube_sample, rescale
 
-COMPILATION_CACHE = Path.home() / ".cache" / "exopt" / "jax"  # compiled proposals, one per history size
+from exopt import link, trials
+from exopt.controller import MAX_TORQUE, PERIODIC
+from exopt.review import write_review
+
+COMPILATION_CACHE = Path(__file__).resolve().parents[2] / ".cache" / "jax"  # compiled proposals, one per history capacity
 
 
-def design(key: Key, atoms: int, n: int) -> Profile:
-    """Latin hypercube of n profiles, stacked."""
-    lower, upper = acquisition.bounds(atoms)
-    return acquisition.latin_hypercube(key, lower, upper, n)
+def variance_range(settings: trials.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
+    """Atom variances l (domain [-X_MAX, X_MAX] for the cycle) of the settings' lengthscales in rad of gait phase."""
+    to_variance = lambda lengthscale: jnp.asarray((lengthscale * X_MAX / jnp.pi) ** 2)
+    return to_variance(settings.min_lengthscale), to_variance(settings.max_lengthscale)
+
+
+def design(key: Key, atoms: int, n: int, l_range: tuple[Float[Array, ""], Float[Array, ""]]) -> RBFMixture:
+    """Latin hypercube of n profiles over the acquisition's box, stacked."""
+    u = latin_hypercube_sample(key, (n, atoms, 3))
+    log_l = rescale(u[..., 0], *map(jnp.log, l_range))
+    x = rescale(u[..., 1], -X_MAX, X_MAX)
+    a = rescale(u[..., 2], -acquisition.A_MAX, acquisition.A_MAX)
+    return RBFMixture(jnp.exp(log_l)[..., None], x[..., None], a)
+
+
+def stack(
+    profiles: list[RBFMixture], losses: list[float], ses: list[float]
+) -> tuple[RBFMixture, Float[Array, "n"], Float[Array, "n"]]:
+    """One batched history, nan-padded to a power-of-2 length so proposals recompile only when it doubles."""
+    m = max(p.a.shape[-1] for p in profiles)
+    n = max(8, 1 << (len(profiles) - 1).bit_length())
+    padded = [p.pad_to(m) for p in profiles]
+    padded += [padded[0]] * (n - len(padded))
+    ys = jnp.full(n, jnp.nan).at[: len(losses)].set(jnp.array(losses))
+    # an undefined SE counts as noiseless, the fitted nugget still applies
+    y_stds = jnp.zeros(n).at[: len(ses)].set(jnp.nan_to_num(jnp.array(ses), nan=0.0, posinf=0.0))
+    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *padded), ys, y_stds
 
 
 def best_posterior(surrogate: GaussianProcess) -> dict[str, Float[Array, ""]]:
-    """Posterior mean and sd of the observed profile the surrogate believes best."""
-    mean, cov = surrogate.predict(surrogate.xs)
-    best = jnp.argmin(mean)
-    return dict(best_mean=mean[best], best_sd=jnp.sqrt(cov[best, best]))
+    """Posterior mean and sd of the observed profile the surrogate believes best, and the mean posterior sd over all."""
+    mean, var = surrogate.predict_marginal(surrogate.f)
+    sd = jnp.sqrt(var)
+    observed = jnp.isfinite(surrogate.y)
+    best = jnp.where(observed, mean, jnp.inf).argmin()
+    return dict(best_mean=mean[best], best_sd=sd[best], mean_sd=jnp.average(sd, weights=observed))
 
 
-@partial(jax.jit, static_argnames=("atoms", "mode", "raw_samples", "max_restarts"))
+@partial(jax.jit, static_argnames=("atoms", "raw_samples", "max_restarts"))
 def propose_next(
     key: Key,
-    xs: Profile,
+    history: RBFMixture,
     ys: Float[Array, "n"],
-    ses: Float[Array, "n"],
+    y_stds: Float[Array, "n"],
+    l_range: tuple[Float[Array, ""], Float[Array, ""]],
     atoms: int = 2,
-    mode: str = "functional",
-    raw_samples: int = 256,
-    max_restarts: int = 16,
-) -> tuple[Profile, dict[str, Float[Array, ""]]]:
-    """Maximize log-EI over profiles of `atoms` atoms; also the best posterior, for the stop rule."""
-    embed = EMBEDDINGS[mode]
-    surrogate = GaussianProcess.fit(embed(xs), ys, ses**2)
-    best = best_posterior(surrogate)
-    lower, upper = acquisition.bounds(atoms)
-    candidate = acquisition.optimize_restarts(
-        partial(acquisition.negative_log_ei, surrogate=surrogate, embed=embed, y_best=best["best_mean"]),
-        acquisition.latin_hypercube(key, lower, upper, raw_samples),
-        bounds=(lower, upper),
-        max_restarts=max_restarts,
+    raw_samples: int = 1024,
+    max_restarts: int = 32,
+) -> tuple[RBFMixture, dict[str, Float[Array, ""]]]:
+    """Maximize log-EI over profiles of at least `atoms` atoms; also the posterior summary the stop rule reads."""
+    key_fit, key_acquisition = jr.split(key)
+
+    # one output per profile, padded so candidates get `atoms` atoms
+    history = history.pad_to(max(atoms, history.a.shape[-1]))
+    f = jax.tree.map(lambda z: rearrange(z, "n ... -> n 1 ..."), history)
+    surrogate = GaussianProcess.fit(key_fit, f, ys, y_std=y_stds, periodic=PERIODIC)
+
+    candidate = acquisition.optimize_expected_improvement(
+        key_acquisition, surrogate, l_range, multi_starts=max_restarts, n_probes=raw_samples
     )
-    return candidate, best
+    return jax.tree.map(lambda z: z[0, 0], candidate), best_posterior(surrogate)
 
 
 def enable_compilation_cache() -> None:
@@ -62,41 +94,20 @@ def enable_compilation_cache() -> None:
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 
 
-def compile_proposal(n: int, atoms: int, mode: str, raw_samples: int, max_restarts: int) -> int:
-    """Compile (and cache) the proposal for a history of n trials, as next_profile calls it."""
-    xs = design(jr.key(n), atoms, n)
-    propose_next.lower(
-        jr.key(0), xs, jnp.zeros(n), jnp.ones(n), atoms=atoms, mode=mode,
-        raw_samples=raw_samples, max_restarts=max_restarts,
-    ).compile()
-    return n
-
-
-def warm_cache(args, up_to: int) -> None:
-    """Compile the proposal for every history size up to `up_to` (any initial design size)."""
-    # serial: XLA already compiles on all cores, so threads or processes gain nothing
-    start = time.monotonic()
-    for n in range(1, up_to + 1):
-        compile_proposal(n, args.atoms, args.mode, args.raw_samples, args.max_restarts)
-        print(f"compiled history size {n} ({time.monotonic() - start:.0f} s)", flush=True)
-
-
-def next_profile(key: Key, history: list[trials.Trial], args) -> tuple[Profile, dict | None]:
+def next_profile(key: Key, history: list[trials.Trial], settings: trials.Settings) -> tuple[RBFMixture, dict | None]:
     """Initial design until it is exhausted, then the BO proposal with the best posterior."""
     key_design, key_search = jr.split(key)
-    if len(history) < args.n:
-        initial = design(key_design, args.atoms, args.n)
+    if len(history) < settings.n:
+        initial = design(key_design, settings.atoms, settings.n, variance_range(settings))
         return jax.tree.map(lambda a: a[len(history)], initial), None
 
     candidate, best = propose_next(
         jr.fold_in(key_search, len(history)),
-        Profile.stack([t.profile for t in history]),
-        jnp.array([t.loss for t in history]),
-        jnp.array([t.se for t in history]),
-        atoms=args.atoms,
-        mode=args.mode,
-        raw_samples=args.raw_samples,
-        max_restarts=args.max_restarts,
+        *stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history]),
+        variance_range(settings),
+        atoms=settings.atoms,
+        raw_samples=settings.raw_samples,
+        max_restarts=settings.max_restarts,
     )
     return candidate, {k: float(v) for k, v in best.items()}
 
@@ -124,12 +135,8 @@ def main():
         args.atoms = 1
 
     enable_compilation_cache()
-    if args.warm_cache:
-        warm_cache(args, args.warm_cache)
-        return
 
     samples, profiles = link.driver_link(args.host)
-    deadline = time.monotonic() + 60.0 * args.duration
     try:
         run_session(samples, profiles, deadline, args)
     finally:

@@ -3,9 +3,9 @@ from functools import lru_cache
 from pathlib import Path
 import json
 
+import jax.numpy as jnp
 import numpy as np
-
-from exopt.profiles import Profile
+from bofus.rkhs import RBFMixture
 
 BETA = 5.0  # weight of negative (resistive) power in the objective
 BATCHES = 10  # batch means for the standard error
@@ -42,18 +42,20 @@ def gap_to_best(power: np.ndarray, best_mean: float, best_sd: float) -> float:
     return (-float(power.mean()) - best_mean) / float(np.hypot(standard_error(power), best_sd))
 
 
-# endregion
-################################################################################
+def encode_profile(profile: RBFMixture) -> dict:
+    return {k: v.tolist() for k, v in profile._asdict().items()}
 
 
-################################################################################
-# region Records
+def decode_profile(payload: dict) -> RBFMixture:
+    return RBFMixture(*(jnp.asarray(payload[k], dtype=float) for k in RBFMixture._fields))
 
 
 class Trial(NamedTuple):
     index: int
-    profile: Profile
+    profile: RBFMixture
     samples: dict[str, np.ndarray]
+    settings: Settings = DEFAULT
+    power_assist: float = 0.0
 
     @property
     def loss(self) -> float:
@@ -66,13 +68,13 @@ class Trial(NamedTuple):
         return standard_error(penalized_power(self.samples))
 
 
-def save(exp_dir: str, index: int, profile: Profile, samples: list[dict]) -> Trial:
-    """Record a trial's profile and its samples, stored column-wise."""
+def save(exp_dir: str, index: int, profile: RBFMixture, samples: list[dict], settings: Settings) -> Trial:
+    """Record a trial's profile, its power assist, and its samples, stored column-wise."""
     columns = {c: [s[c] for s in samples] for c in samples[0]}
     path = Path(exp_dir) / f"trial_{index}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(profile.to_dict() | dict(samples=columns)))
-    return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()})
+    path.write_text(json.dumps(encode_profile(profile) | dict(power_assist=settings.power_assist, samples=columns)))
+    return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()}, settings, settings.power_assist)
 
 
 def save_current(exp_dir: str, payload: dict) -> None:
@@ -95,7 +97,8 @@ def load_current(exp_dir: str) -> dict | None:
 def _read(path: Path, mtime: float) -> Trial:
     record = json.loads(path.read_text())
     samples = {c: np.asarray(v) for c, v in record["samples"].items()}
-    return Trial(int(path.stem.removeprefix("trial_")), Profile.from_dict(record), samples)
+    index = int(path.stem.removeprefix("trial"))
+    return Trial(index, decode_profile(record), samples, settings, float(record.get("power_assist", 0.0)))
 
 
 def load(exp_dir: str) -> list[Trial]:
@@ -105,5 +108,3 @@ def load(exp_dir: str) -> list[Trial]:
     return sorted(trials, key=lambda t: t.index)
 
 
-# endregion
-################################################################################

@@ -647,7 +647,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, mode: str):
         if trial is None:
             return (placeholder(p, "no trial selected"),) * 4 + ("",)
         return (
-            profile_figure("profile and its atoms", trial.profile, trial.samples, "measured_torque", atoms=True, p=p),
+            profile_figure("profile and its atoms", trial.profile, trial.samples, "measured_torque", atoms=True,
+                           power_assist=trial.power_assist, p=p),
             power_figure(trial, p=p),
             estimate_figure("convergence of the estimate", trial.samples, p=p),
             portrait_figure(trial, p=p),

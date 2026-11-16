@@ -8,9 +8,17 @@ import sys
 import threading
 import time
 
-from exopt import MAX_TORQUE, link
-from exopt.profiles import Profile
+import jax
+import numpy as np
+from bofus.rkhs import X_MAX, RBFMixture
+from einops import rearrange
+from jaxtyping import Bool, Float
 
+from exopt import link
+from exopt.trials import decode_profile
+
+MAX_TORQUE = 13.0  # [Nm] hardware torque limit per motor
+PERIODIC = (True,)  # a profile's one input, the gait phase, wraps
 SAMPLING_STEP = 0.01  # [s] control loop period
 MIN_CALIBRATION_TIME = 10.0  # [s] minimum time to calibrate the gait frequency
 CALIBRATION_TOL = 0.01  # relative drift of omega per second at convergence
@@ -232,11 +240,13 @@ def main():
 
     estimator = PhaseEstimator()
     # every profile ramps up from zero and back down to zero, so each trial starts alike
-    requested, applied_id = dict(id=None), None
-    harmonics, cos, sin = torque_series(Profile(jnp.zeros(1), jnp.zeros(1), jnp.asarray(1.0)))
-    gain = 0.0
-    start = last_tick = next_tick = time.monotonic()
-    stage = "standing"
+    requested, applied_id, gain, ramp_cycles = dict(id=None), None, 0.0, GAIN_RAMP_CYCLES
+    profile_table = np.zeros_like(PROFILE_GRID)
+    start = last_tick = next_tick = idle_since = still_since = time.monotonic()
+    standing_pose = None
+    stage = None
+
+    # stream samples and apply the requested profiles until ctrl-c, or IDLE_TIMEOUT with nothing connected
     try:
         while (now := time.monotonic()) - start < 60.0 * args.duration:
             position, velocity, measured_torque = legs.read()
@@ -251,26 +261,28 @@ def main():
             update = link.latest_message(profiles) if estimator.calibrated else None
             if update is not None and update["id"] != requested["id"]:
                 requested = update
+                ramp_cycles = requested.get("ramp_cycles", ramp_cycles)
                 print(f"profile {requested['id']}" if requested["id"] else "release")
 
-            # swap profiles only at zero gain, then ramp up; ramp down on release or a new request
+            # swap profiles only at zero gain, then ramp up; ramp down on release, a new request or a stop
             if gain == 0.0 and requested["id"] not in (None, applied_id):
                 applied_id = requested["id"]
-                harmonics, cos, sin = torque_series(Profile.from_dict(requested))
-            target = 1.0 if requested["id"] is not None and requested["id"] == applied_id else 0.0
-            step = (now - last_tick) / GAIN_RAMP_TIME
+                profile_table = profile_torque(decode_profile(requested), PROFILE_GRID, requested.get("power_assist", 0.0))
+            applying = requested["id"] is not None and requested["id"] == applied_id and stage == "running"
+            target = 1.0 if applying else 0.0
+            step = (now - last_tick) * estimator.omega / (2 * np.pi * ramp_cycles) if phase is not None else 0.0
             gain = min(gain + step, target) if gain < target else max(gain - step, target)
             last_tick = now
 
             # zero torque until calibrated
-            phase, torque = None, np.zeros(2)
-            if estimator.calibrated:
-                phase = estimator(position, velocity)
-                angle = np.outer(phase, harmonics)
-                fraction = np.cos(angle) @ cos + np.sin(angle) @ sin
-                torque = MAX_TORQUE * np.clip(gain * fraction, -1.0, 1.0)
-            legs.command(torque)
+            torque = np.zeros(2)
+            if phase is not None:
+                torque = gain * np.interp(phase, PROFILE_GRID, profile_table, period=2 * np.pi)
+            for md, leg_torque in zip(candle.md80s, torque):
+                md.setTargetTorque(float(leg_torque))
 
+            columns = dict(phase=phase, position=position, velocity=velocity, torque=torque,
+                           measured_torque=measured_torque)
             samples.send_json(
                 dict(time=now - start, stage=stage, profile_id=applied_id, gain=gain)
                 | per_leg(
