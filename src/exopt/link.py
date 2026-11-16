@@ -4,7 +4,7 @@ import time
 import numpy as np
 import zmq
 
-from exopt.trials import gap_to_best, penalized_power
+from exopt.trials import Settings, columns, gait_estimate, stop_reason
 
 SAMPLE_PORT = 5555  # controller PUB -> driver SUB, one JSON dict per control step
 PROFILE_PORT = 5556  # driver PUB -> controller SUB, one JSON dict per profile request or release
@@ -54,23 +54,16 @@ def release(profiles: zmq.Socket) -> None:
     profiles.send_json(dict(id=None))
 
 
-def collect_segment(
-    samples: zmq.Socket,
-    profiles: zmq.Socket,
-    payload: dict,
-    warmup: int,
-    min_samples: int = 100,
-    max_samples: int = 2000,
-) -> list[dict]:
-    """Publish the profile and gather samples until it is unlikely to beat the best.
+def collect_segment(samples: zmq.Socket, profiles: zmq.Socket, payload: dict, settings: Settings) -> tuple[list[dict], str]:
+    """Publish the profile and gather samples until payload["stop_rule"] stops it (trials.stop_reason), and why.
 
-    Warmup counts from the end of the controller's ramp up. With payload["stop_rule"]
-    (best posterior mean, sd, z) the segment ends once its running loss sits more
-    than z standard deviations above the best; otherwise it runs to max_samples.
+    The warm-up counts from the end of the controller's ramp up; valid gaits (trials.gait_slices) count after it. The segment
+    returned ends with a gait. Raises ConnectionError after STALL seconds without samples (the controller streams from
+    startup).
     """
-    collected, power = [], []
-    rule = payload.get("stop_rule")
-    published_at = None
+    collected, phase = [], None
+    rule = payload["stop_rule"]
+    published_at, heard_at = None, time.monotonic()
     while True:
         # republish every second until the profile is fully ramped up (slow-joiner losses)
         if not collected and (published_at is None or time.monotonic() - published_at > 1.0):
@@ -84,15 +77,13 @@ def collect_segment(
         if sample["profile_id"] != payload["id"] or sample["gain"] < 1.0:
             continue
         collected.append(sample)
-        n = len(collected) - warmup
-        if n < 1:
+        if len(collected) <= settings.warmup:
             continue
 
-        # stop once the segment is confidently worse than the best (or the budget is exhausted)
-        power.append(float(penalized_power(sample)))
-        if n >= max_samples:
-            break
-        if rule and n >= min_samples:
-            if gap_to_best(np.asarray(power), rule["best_mean"], rule["best_sd"]) > rule["z"]:
-                break
-    return collected[warmup:]
+        # a gait ends where leg 0's phase wraps: check the rule on the segment up to it
+        wrapped = None not in (phase, sample["phase_0"]) and sample["phase_0"] - phase < -np.pi
+        phase = sample["phase_0"]
+        if wrapped:
+            segment = collected[settings.warmup:-1]
+            if reason := stop_reason(*gait_estimate(columns(segment), settings), rule, settings):
+                return segment, reason

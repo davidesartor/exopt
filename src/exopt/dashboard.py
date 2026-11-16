@@ -650,7 +650,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, warmup: int, mode: str):
             profile_figure("profile and its atoms", trial.profile, trial.samples, "measured_torque", atoms=True,
                            power_assist=trial.power_assist, p=p),
             power_figure(trial, p=p),
-            estimate_figure("convergence of the estimate", trial.samples, p=p),
+            estimate_figure("convergence of the estimate", trial.samples, trial.settings, p=p),
             portrait_figure(trial, p=p),
             trial_summary(trial),
         )

@@ -17,9 +17,6 @@ env/
 # uv
 # (uv.lock is committed intentionally)
 
-# Compiled JAX proposals
-.cache/
-
 # Jupyter
 .ipynb_checkpoints/
 

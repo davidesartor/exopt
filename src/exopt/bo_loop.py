@@ -10,8 +10,8 @@ import jax.random as jr
 import argparse
 import os
 import signal
+import threading
 import uuid
-from pathlib import Path
 
 from einops import rearrange
 from bofus import acquisition
@@ -23,7 +23,7 @@ from exopt import link, trials
 from exopt.controller import MAX_TORQUE, PERIODIC
 from exopt.review import write_review
 
-COMPILATION_CACHE = Path(__file__).resolve().parents[2] / ".cache" / "jax"  # compiled proposals, one per history capacity
+MAX_CAPACITY = 1024  # largest history capacity compiled ahead
 
 
 def variance_range(settings: trials.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
@@ -41,12 +41,17 @@ def design(key: Key, atoms: int, n: int, l_range: tuple[Float[Array, ""], Float[
     return RBFMixture(jnp.exp(log_l)[..., None], x[..., None], a)
 
 
+def capacity(trials_count: int) -> int:
+    """History length a proposal is padded to: a power of 2, at least 8."""
+    return max(8, 1 << (trials_count - 1).bit_length())
+
+
 def stack(
     profiles: list[RBFMixture], losses: list[float], ses: list[float]
 ) -> tuple[RBFMixture, Float[Array, "n"], Float[Array, "n"]]:
     """One batched history, nan-padded to a power-of-2 length so proposals recompile only when it doubles."""
     m = max(p.a.shape[-1] for p in profiles)
-    n = max(8, 1 << (len(profiles) - 1).bit_length())
+    n = capacity(len(profiles))
     padded = [p.pad_to(m) for p in profiles]
     padded += [padded[0]] * (n - len(padded))
     ys = jnp.full(n, jnp.nan).at[: len(losses)].set(jnp.array(losses))
@@ -89,9 +94,17 @@ def propose_next(
     return jax.tree.map(lambda z: z[0, 0], candidate), best_posterior(surrogate)
 
 
-def enable_compilation_cache() -> None:
-    jax.config.update("jax_compilation_cache_dir", str(COMPILATION_CACHE))
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+def compile_ahead(history: list[trials.Trial], settings: trials.Settings) -> None:
+    """Compile the proposal for each coming history capacity, so none stalls the session; jit reuses them."""
+    profiles = [t.profile for t in history] or [jax.tree.map(lambda z: z[0], design(
+        jr.key(0), settings.atoms, 1, variance_range(settings)))]
+    size = capacity(max(len(history) + 1, settings.n))
+    while size <= MAX_CAPACITY:
+        propose_next.lower(
+            jr.key(0), *stack((profiles * size)[:size], [0.0] * size, [0.0] * size), variance_range(settings),
+            atoms=settings.atoms, raw_samples=settings.raw_samples, max_restarts=settings.max_restarts,
+        ).compile()
+        size *= 2
 
 
 def next_profile(key: Key, history: list[trials.Trial], settings: trials.Settings) -> tuple[RBFMixture, dict | None]:
@@ -116,54 +129,54 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="localhost", help="controller host (tunnel endpoint)")
     parser.add_argument("--exp-dir", default="experiments/mock", help="folder recording the session")
-    parser.add_argument("--duration", type=float, default=30.0, help="experiment time [min]")
-    parser.add_argument("--atoms", type=int, default=2, help="periodized RBF atoms per profile")
-    parser.add_argument("--mode", choices=EMBEDDINGS, default="functional",
-                        help="GP on the L2 distance between profiles, or on a single atom's coefficients")
-    parser.add_argument("--n", type=int, default=4, help="initial design size")
-    parser.add_argument("--warmup", type=int, default=100, help="samples dropped after the ramp up")
-    parser.add_argument("--z", type=float, default=3.0, help="stop a segment this many sd above the best")
-    parser.add_argument("--min-samples", type=int, default=100)
-    parser.add_argument("--max-samples", type=int, default=2000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--raw-samples", type=int, default=1024)
-    parser.add_argument("--max-restarts", type=int, default=16)
-    parser.add_argument("--warm-cache", type=int, metavar="N",
-                        help="only compile the proposals for histories up to N trials, then exit")
+    for name, default in trials.DEFAULT._asdict().items():
+        label, hint = trials.SETTINGS_HELP[name]
+        parser.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default,
+                            help=f"{label}{f': {hint}' if hint else ''} (default {default})")
     args = parser.parse_args()
-    if args.mode == "coefficients":
-        args.atoms = 1
+    settings = trials.Settings(**{name: getattr(args, name) for name in trials.Settings._fields})
+    # an SE needs 2 gaits
+    settings = settings._replace(min_gaits=max(settings.min_gaits, 2))
+    settings = settings._replace(max_gaits=max(settings.max_gaits, settings.min_gaits))
+    if not abs(settings.power_assist) < MAX_TORQUE:
+        parser.error(f"--power-assist must be below the {MAX_TORQUE:g} Nm torque limit")
+    # every trial of the folder is scored under the settings it last ran with
+    trials.save_settings(args.exp_dir, settings)
 
-    enable_compilation_cache()
+    # SIGINT stops the session cleanly even when launched with it ignored (a background job)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    if os.name == "nt":  # the dashboard's stop on Windows is a ctrl-break
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
     samples, profiles = link.driver_link(args.host)
     try:
-        run_session(samples, profiles, deadline, args)
+        run_session(samples, profiles, args.exp_dir, settings)
+    except ConnectionError as error:
+        print(f"Stopped: {error}")
     finally:
         link.release(profiles)
 
 
-def run_session(samples, profiles, deadline: float, args) -> None:
-    """Propose, ramp up, collect, release, record, until the deadline."""
-    while time.monotonic() < deadline:
-        history = trials.load(args.exp_dir)
-        profile, best = next_profile(jr.key(args.seed), history, args)
+def run_session(samples, profiles, exp_dir: str, settings: trials.Settings) -> None:
+    """Propose, ramp up, collect, release, record, until interrupted or the controller is gone."""
+    # compiled while the first trials run (the initial design needs none)
+    threading.Thread(target=compile_ahead, args=(trials.load(exp_dir), settings), daemon=True).start()
+    while True:
+        history = trials.load(exp_dir)
+        profile, best = next_profile(jr.key(settings.seed), history, settings)
 
         # a fresh id per publish, so the controller never mistakes it for a stale profile
         index = max((t.index for t in history), default=0) + 1
-        payload = profile.to_dict() | dict(id=f"{index}-{uuid.uuid4().hex[:6]}")
-        if best is not None:
-            payload["stop_rule"] = best | dict(z=args.z)
-        trials.save_current(args.exp_dir, payload)
-        collected = link.collect_segment(
-            samples, profiles, payload, args.warmup,
-            min_samples=args.min_samples, max_samples=args.max_samples,
-        )
+        payload = trials.encode_profile(profile) | dict(id=f"{index}-{uuid.uuid4().hex[:6]}",
+                                                        ramp_cycles=settings.ramp_cycles, power_assist=settings.power_assist,
+                                                        stop_rule=best or {})
+        trials.save_current(exp_dir, payload)
+        collected, reason = link.collect_segment(samples, profiles, payload, settings)
         # ramp down to zero while the next proposal is computed
         link.release(profiles)
-        trial = trials.save(args.exp_dir, index, profile, collected)
+        trial = trials.save(exp_dir, index, profile, collected, settings)
         best = min([t.loss for t in history] + [trial.loss])
-        print(f"trial {index}: {len(collected)} samples, loss {trial.loss:.4f} ± {trial.se:.4f} (best {best:.4f})")
+        print(f"trial {index}: {len(trials.gait_slices(trial.samples, settings))} valid gaits ({reason}), loss {trial.loss:.4f} ± {trial.se:.4f} (best {best:.4f})")
 
 
 if __name__ == "__main__":
