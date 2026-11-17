@@ -148,22 +148,6 @@ def git(*args: str, timeout: float = 60) -> subprocess.CompletedProcess:
                           env=os.environ | dict(GIT_TERMINAL_PROMPT="0"))
 
 
-def sync_results(folder: str) -> str:
-    """Commit an experiment folder alone and push it: what happened, for the page."""
-    path, name = str(Path(folder).resolve()), os.path.basename(folder)
-    steps = [("add", "--", path), ("commit", "-m", f"data: {name}", "--", path),
-             ("pull", "--rebase", "--autostash"), ("push",)]
-    try:
-        for args in steps:
-            done = git(*args, timeout=600)
-            if done.returncode:
-                reason = (done.stderr or done.stdout).strip().splitlines() or [f"exit {done.returncode}"]
-                return f"sync failed (git {args[0]}): {reason[-1]}"
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return f"sync failed: {error}"
-    return f"{name} synced"
-
-
 # a force pull keeps local commits on a branch and uncommitted changes in the stash
 BACKUP_BRANCH = "pre-force-pull"
 FORCE_PULL = (("branch", "-f", BACKUP_BRANCH), ("stash",), ("reset", "--hard", "@{u}"))
@@ -408,7 +392,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                 html.Button("Restart controller", id="controller-start", className="primary", style=hide),
                 html.Button("Reconnect", id="reconnect", className="primary", style=hide),
                 html.Button("Stop experiment", id="stop", className="danger", style=hide),
-                html.Span(id="sync-note", className="hint"),
             ]),
         ]), console]),
     ])
@@ -453,7 +436,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         config, configure_new,
         dcc.Store(id="selected"), dcc.Store(id="latest-trial"),
         dcc.Store(id="theme"),
-        dcc.ConfirmDialog(id="sync-confirm", message="Do you want to sync the results?"),
         dcc.ConfirmDialog(id="force-pull-confirm"),
         dcc.Store(id="live-loop"),
         dcc.Store(id="browse-dir"), dcc.Store(id="repo"), dcc.Store(id="ssh-checked"),
@@ -809,23 +791,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         return f"saved to {experiments}/{time.strftime('%Y-%m-%d')}-{slug}"
 
     @app.callback(
-        Output("sync-confirm", "displayed"),
-        Input("stop", "n_clicks"), Input("sync-confirm", "submit_n_clicks"), prevent_initial_call=True,
-    )
-    def sync_prompt(_stop, _submit):
-        process, folder = run["process"], run["exp_dir"]
-        if ctx.triggered_id == "stop":
-            return experiment_running()
-        # commit once bo-loop has ramped down and written its last trial
-        def sync():
-            run["sync"] = f"syncing {os.path.basename(folder)}…"
-            if process is not None:
-                process.wait()
-            run["sync"] = sync_results(folder)
-        threading.Thread(target=sync, daemon=True).start()
-        return False
-
-    @app.callback(
         Output("force-pull-confirm", "displayed"), Output("force-pull-confirm", "message"),
         Input("slow", "n_intervals"), prevent_initial_call=True,
     )
@@ -911,7 +876,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         Output("controller-log", "children"), Output("console-summary", "children"),
         Output("controller-stop", "disabled"), Output("tiles", "children"),
         Output("session-pill", "children"), Output("experiment-pill", "children"), Output("disconnect", "disabled"),
-        Output("sync-note", "children"),
         Input("controller-start", "n_clicks"), Input("controller-stop", "n_clicks"),
         Input("start", "n_clicks"), Input("stop", "n_clicks"), Input("reconnect", "n_clicks"),
         Input("fast", "n_intervals"),
@@ -921,7 +885,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         """Act on a click, then render the session from server state (so a dropped response heals on the next tick)."""
         name, values = args[-1 - len(trials.Settings._fields)], args[-len(trials.Settings._fields):]
         if state["session"] is None or state["session"]["name"] is None:
-            return (no_update,) * 18
+            return (no_update,) * 17
         tunnel, trigger = cast(Tunnel, state["tunnel"]), ctx.triggered_id
 
         # clicks: reconnect, the controller, the experiment
@@ -949,7 +913,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             options = {k: default if v is None else type(default)(v)
                        for (k, default), v in zip(defaults._asdict().items(), values)}
             folder = os.path.join(experiments, f"{time.strftime('%Y-%m-%d')}-{name.strip().replace(' ', '-')}")
-            run.update(process=launch_bo_loop(folder, host, options), started=time.monotonic(), exp_dir=folder, sync=None,
+            run.update(process=launch_bo_loop(folder, host, options), started=time.monotonic(), exp_dir=folder,
                        t0=buffer[-1]["time"] if buffer else None)
         elif trigger == "stop" and experiment_running():
             # an interrupt, so bo-loop releases the profile and the torque ramps down
@@ -989,7 +953,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             now.detail, progress_bar(*now.progress) if now.progress else None,
             *(shown(id) for id in actions), log, summary, not running,
             [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment, experiment_running(),
-            run.get("sync"),
         )
 
     @app.callback(

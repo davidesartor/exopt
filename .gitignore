@@ -32,6 +32,6 @@ htmlcov/
 .idea/
 .DS_Store
 
-# Archived experiments, kept local (new ones in experiments/ are committed on stop)
+# Experiment data, kept local
 attic/
-experiments/mock/
+experiments/
