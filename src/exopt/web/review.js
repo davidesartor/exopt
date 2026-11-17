@@ -17,6 +17,7 @@ function showTrial(position) {
 function drawAll() {
   for (const name of Object.keys(data.optimization)) draw(name, data.optimization[name]);
   if (data.trials.length) showTrial(shown);
+  draw("experiment", data.experiment);
 }
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);

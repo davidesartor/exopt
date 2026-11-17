@@ -94,6 +94,21 @@ def propose_next(
     return jax.tree.map(lambda z: z[0, 0], candidate), best_posterior(surrogate)
 
 
+@jax.jit
+def posterior_means(key: Key, history: RBFMixture, ys: Float[Array, "n"], y_stds: Float[Array, "n"]) -> Float[Array, "n"]:
+    """Posterior mean loss at each profile of the history, infinite at the padding."""
+    f = jax.tree.map(lambda z: rearrange(z, "n ... -> n 1 ..."), history)
+    surrogate = GaussianProcess.fit(key, f, ys, y_std=y_stds, periodic=PERIODIC)
+    mean, _ = surrogate.predict_marginal(surrogate.f)
+    return jnp.where(jnp.isfinite(ys), jnp.ravel(mean), jnp.inf)
+
+
+def best_trial(history: list[trials.Trial], settings: trials.Settings) -> trials.Trial:
+    """The trial whose profile has the lowest posterior mean loss."""
+    stacked = stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history])
+    return history[int(posterior_means(jr.key(settings.seed), *stacked).argmin())]
+
+
 def compile_ahead(history: list[trials.Trial], settings: trials.Settings) -> None:
     """Compile the proposal for each coming history capacity, so none stalls the session; jit reuses them."""
     profiles = [t.profile for t in history] or [jax.tree.map(lambda z: z[0], design(

@@ -176,7 +176,9 @@ def profile_torque(
 
     The base is the power assist sinusoid of peak `power_assist` before the tanh, so a zero mixture applies it exactly."""
     values = jax.vmap(lambda x: profile(x, PERIODIC))(rearrange(unit_phase(phase), "p -> p 1"))
-    base = np.arctanh(power_assist_torque(power_assist, phase) / MAX_TORQUE)
+    # a peak at MAX_TORQUE puts the base at ±inf, where the tanh saturates exactly
+    with np.errstate(divide="ignore"):
+        base = np.arctanh(power_assist_torque(power_assist, phase) / MAX_TORQUE)
     return MAX_TORQUE * np.tanh(base + np.asarray(values))
 
 

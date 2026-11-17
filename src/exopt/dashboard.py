@@ -2,6 +2,7 @@
 
 from typing import NamedTuple, cast
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 import argparse
 import json
@@ -21,9 +22,9 @@ import numpy as np
 import paramiko
 import plotly.graph_objects as go
 
-from exopt import link, trials
-from exopt.figures import (CLICKABLE, LIGHT, LIVE_ROWS, LIVE_STRIDE, LIVE_WINDOW, PAGE_CSS, THEMES, TRIAL, WEB, Palette,
-                           break_wraps, cycles, estimate_figure, gait_period, live_figure,
+from exopt import link, metabolic, trials
+from exopt.figures import (CLICKABLE, LIGHT, LIVE_HEIGHT, LIVE_ROWS, LIVE_STRIDE, LIVE_WINDOW, PAGE_CSS, THEMES, TRIAL, WEB, Palette,
+                           break_wraps, cycles, estimate_figure, experiment_figure, gait_period, live_figure,
                            load_trials, loss_figure, placeholder, portrait_figure, power_figure, profile_figure,
                            profiles_figure, review_headline, trial_summary)
 from exopt.tunnel import (SSH_CONFIG, Tunnel, delete_controller, known_hosts, save_controller, save_host,
@@ -130,6 +131,26 @@ def live_tiles(s: dict, last: dict | None, segment: dict, history: list[trials.T
     tiles.append(("best so far", f"{best.loss:.3f}", f"trial {best.index} of {len(history)}") if best
                  else ("best so far", "—", "no trials yet"))
     return tiles
+
+
+def held_label(payload: dict | None) -> str:
+    """What a metabolic recording holds the exo on."""
+    if payload is None:
+        return "exo off"
+    return "power assist" if payload["trial"] is None else f"best profile (trial {payload['trial']})"
+
+
+def metabolic_status(last: dict, payload: dict | None, elapsed: float) -> Status:
+    """The metabolic test's status: recording since Start, the torque ramping to the held profile, or walking stopped."""
+    eyebrow = f"metabolic recording · {held_label(payload)}"
+    clock = f"{int(elapsed // 60)}:{int(elapsed % 60):02d} recorded"
+    if last["stage"] != "running":
+        return Status(2, "action", "Walking stopped", f"{clock}, still recording. Start walking again to resume.",
+                      "stop", eyebrow)
+    if payload and (last["profile_id"] != payload["id"] or last["gain"] < 1):
+        return Status(2, "busy", "Ramping up the torque", f"{clock}. Keep walking.", "stop", eyebrow)
+    return Status(2, "ok", "Recording", f"{clock}. Stop when the metabolic measurement ends.", "stop",
+                  eyebrow)
 
 
 def launch_bo_loop(exp_dir: str, host: str, options: dict) -> subprocess.Popen:
@@ -244,15 +265,20 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
     # drain the controller's sample stream from a background thread: a rolling buffer, and a thinned whole record
-    stream, _ = link.driver_link(host)
+    stream, profiles = link.driver_link(host)
     buffer: deque[dict] = deque(maxlen=int(BUFFER_SECONDS / 0.01))
     trajectory: deque[tuple] = deque(maxlen=int(4 * 3600 / 0.01 / TRAJECTORY_STRIDE))
     received = dict(at=-math.inf)
+    # the metabolic test held now, if any: tagged in the experiment's stream
+    recording: dict = dict(token=None, payload=None, started=None)
+    # every sample while an experiment is open, stamped with this computer's clock, to its stream file
+    stream_log, stream_path = trials.StreamLog(), dict(path=None)
 
     def pump():
         count = 0
         while True:
             sample = cast(dict, stream.recv_json())
+            stream_log.write(stream_path["path"], sample | dict(wall_time=time.time()))
             # a controller restart resets its clock: drop the previous run
             if buffer and sample["time"] < buffer[-1]["time"]:
                 buffer.clear()
@@ -267,7 +293,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
 
     # the folder and surrogate shown, and the bo-loop launched from the page, if any
     experiments = os.path.dirname(exp_dir) or "."
-    run = dict(exp_dir=exp_dir, process=None, started=None, t0=None)
+    # opened: an experiment is open (its folder exp_dir); metabolic: the last recording's mode
+    run = dict(exp_dir=exp_dir, opened=False, process=None, started=None, t0=None, metabolic=None)
     # the session shown (None: the landing page; name None: review only) and the configure window's state
     state: dict = dict(session=None, tunnel=None, repo=None, autostart=False)
     start_lock = threading.Lock()
@@ -354,10 +381,12 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     config = html.Div(id="config", className="modal", style=hide, children=[
         html.Div(className="card", children=[
             html.H3("New experiment"),
-            html.P("Each experiment gets its own folder. The defaults are fine for a normal session."),
+            html.P("Each experiment gets a folder for its settings, optimization trials and everything the exo recorded. "
+                   "An existing name continues that experiment. The defaults are fine for a normal session."),
             html.Div(className="form", children=[
-                field("Name", dcc.Input(id="exp-name", placeholder="e.g. subject1", style=dict(width="100%")),
-                      html.Span(id="exp-folder")),
+                field("Name", dcc.Input(id="exp-name", list="exp-folders", placeholder="e.g. subject1",
+                                        style=dict(width="100%")), html.Span(id="exp-folder")),
+                html.Datalist(id="exp-folders"),
                 *map(setting_field, BASIC_SETTINGS),
             ]),
             html.Details(className="advanced", children=[
@@ -366,8 +395,27 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                                                      if name not in BASIC_SETTINGS]),
             ]),
             html.Div(className="controls", style=dict(marginTop="20px"), children=[
-                html.Button("Start", id="start", className="primary"), html.Button("Cancel", id="cancel"),
+                html.Button("Start experiment", id="start", className="primary"), html.Button("Cancel", id="cancel"),
                 html.Span(id="exp-note", className="error-text"),
+            ]),
+        ]),
+    ])
+    metabolic_config = html.Div(id="metabolic-config", className="modal", style=hide, children=[
+        html.Div(className="card", children=[
+            html.H3("Metabolic measurement"),
+            html.P("Start the metabolic cart together with Start here. The exo is held on the mode until Stop, which "
+                   "tags its start and stop in the experiment's recorded stream (samples stamped with this computer's clock)."),
+            html.Div(className="form", children=[
+                field("Mode", dcc.RadioItems(id="metabolic-condition", value="off", options=[
+                    dict(label=f" {label}", value=value) for value, label in metabolic.CONDITIONS.items()]),
+                      html.Span(id="metabolic-held")),
+                field("Label", dcc.Input(id="metabolic-label", placeholder="optional, e.g. pre", style=dict(width="100%")),
+                      "added to the file name, to tell apart tests of the same mode"),
+            ]),
+            html.Div(className="controls", style=dict(marginTop="20px"), children=[
+                html.Button("Start", id="metabolic-start", className="primary"),
+                html.Button("Cancel", id="metabolic-cancel"),
+                html.Span(id="metabolic-note", className="error-text"),
             ]),
         ]),
     ])
@@ -389,9 +437,14 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
             html.Div(className="actions", children=[
                 html.Button("Start experiment", id="configure", className="primary", style=hide),
+                html.Div(className="stack", children=[
+                    html.Button("Start optimization", id="optimize", className="primary", style=hide),
+                    html.Button("Metabolic measurement", id="metabolic", className="primary", style=hide),
+                    html.Button("Close experiment", id="close-experiment", style=hide),
+                ]),
                 html.Button("Restart controller", id="controller-start", className="primary", style=hide),
                 html.Button("Reconnect", id="reconnect", className="primary", style=hide),
-                html.Button("Stop experiment", id="stop", className="danger", style=hide),
+                html.Button("Stop optimization", id="stop", className="danger", style=hide),
             ]),
         ]), console]),
     ])
@@ -421,6 +474,11 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         html.Div(className="hint", style=dict(margin="-4px 0 8px"),
                  children="Click a point in “loss per trial” or a line in “profiles tried” to inspect another trial."),
         grid(*(f"trial-{name}" for name in TRIAL)),
+        html.Div(className="section-head", children=[
+            html.H2("Whole experiment"),
+            html.Span("leg signals, shaded by trial and by the transitions between them", className="hint"),
+        ]),
+        grid("experiment"),
     ])
     app.layout = html.Div(className="page", children=[
         html.Header(className="topbar", children=[
@@ -433,7 +491,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         ]),
         landing,
         html.Div(id="session", style=hide, children=[status_section, live_section, review_section]),
-        config, configure_new,
+        config, metabolic_config, configure_new,
         dcc.Store(id="selected"), dcc.Store(id="latest-trial"),
         dcc.Store(id="theme"),
         dcc.ConfirmDialog(id="force-pull-confirm"),
@@ -732,6 +790,32 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     def experiment_running() -> bool:
         return run["process"] is not None and run["process"].poll() is None
 
+    def recording_active() -> bool:
+        return recording["token"] is not None
+
+    def busy() -> bool:
+        return experiment_running() or recording_active()
+
+    def hold(token: object):
+        """Hold the mode (republished each second, the controller ignores repeats), then release and tag the stop."""
+        path = stream_path["path"]
+        while recording["token"] is token:
+            profiles.send_json(recording["payload"] or dict(id=None))
+            time.sleep(1.0)
+        link.release(profiles)
+        stream_log.event(path, dict(metabolic="stop", stopped_at=datetime.now().astimezone().isoformat()))
+
+    def start_recording(folder: str, condition: str, payload: dict | None, label: str):
+        trials.save_current(folder, payload)
+        token = object()
+        recording.update(token=token, payload=payload, started=time.monotonic())
+        stream_log.event(stream_path["path"], dict(
+            metabolic="start", condition=condition, label=label.strip(), trial=payload and payload["trial"],
+            profile=payload, started_at=datetime.now().astimezone().isoformat(),
+        ))
+        run.update(exp_dir=folder, t0=buffer[-1]["time"] if buffer else None, metabolic=condition)
+        threading.Thread(target=hold, args=(token,), daemon=True).start()
+
     def open_session(name: str) -> str:
         """Open a session (a configured controller's: its tunnel, then its controller); why not, if it cannot."""
         config = next((c for c in saved_controllers() if c["name"] == name), None)
@@ -765,7 +849,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             note = open_session(picked) if picked not in (None, NEW) else "configure a controller first"
         elif ctx.triggered_id == "review-only" and state["session"] is None:
             state.update(session=dict(name=None))
-        elif ctx.triggered_id == "disconnect" and not experiment_running():
+        elif ctx.triggered_id == "disconnect" and not busy():
             close_session()
         if state["session"] is None:
             return dict(), hide, hide, hide, hide, note, no_update, no_update, no_update
@@ -773,22 +857,69 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             return hide, dict(), dict(), hide, hide, note, hide, hide, "Back"
         return hide, dict(), dict(), dict(), dict(), note, dict(), dict(), "Disconnect"
 
+    def named_folder(name: str) -> str:
+        """An existing experiment folder of that name, else today's new one."""
+        name = name.strip()
+        existing = os.path.join(experiments, name)
+        if name and os.path.isdir(existing):
+            return existing
+        return os.path.join(experiments, f"{time.strftime('%Y-%m-%d')}-{name.replace(' ', '-') or '<name>'}")
+
+    def folder_options() -> list:
+        return [html.Option(value=os.path.basename(f)) for f in experiment_folders(experiments)]
+
     @app.callback(
-        Output("config", "style"), Output("exp-note", "children"),
+        Output("config", "style"), Output("exp-note", "children"), Output("exp-folders", "children"),
         Input("configure", "n_clicks"), Input("start", "n_clicks"), Input("cancel", "n_clicks"),
         State("exp-name", "value"), prevent_initial_call=True,
     )
     def config_window(_configure, _start, _cancel, name):
         if ctx.triggered_id == "configure":
-            return dict(display="flex"), ""
+            return dict(display="flex"), "", folder_options()
         if ctx.triggered_id == "start" and not (name and name.strip()):
-            return no_update, "give the experiment a name"
+            return no_update, "give the experiment a name", no_update
+        return hide, "", no_update
+
+    @app.callback(Output("exp-folder", "children"), *(Output(f"exp-{name}", "value") for name in trials.Settings._fields),
+                  Input("exp-name", "value"))
+    def experiment_folder(name):
+        folder = named_folder(name or "")
+        if os.path.isdir(folder):
+            return f"continues {folder} ({len(load_trials(folder))} trials)", *trials.load_settings(folder)
+        return f"saved to {folder}", *(no_update for _ in trials.Settings._fields)
+
+    held_payloads: dict[tuple, dict | None] = {}  # per folder, mode and trial count: the best profile takes a fit
+
+    def metabolic_mode(condition: str) -> tuple[str, dict | None, str]:
+        """The open experiment's folder and the profile a recording holds; else why not."""
+        folder = run["exp_dir"]
+        count = len(load_trials(folder))
+        if condition == "best" and not count:
+            return None, None, f"{os.path.basename(folder)} has no trials to take the best profile from"
+        if (folder, condition, count) not in held_payloads:
+            held_payloads[folder, condition, count] = metabolic.steady_payload(folder, condition)
+        return folder, held_payloads[folder, condition, count], ""
+
+    @app.callback(
+        Output("metabolic-config", "style"), Output("metabolic-note", "children"),
+        Input("metabolic", "n_clicks"), Input("metabolic-start", "n_clicks"), Input("metabolic-cancel", "n_clicks"),
+        State("metabolic-condition", "value"), prevent_initial_call=True,
+    )
+    def metabolic_window(_open, _start, _cancel, condition):
+        if ctx.triggered_id == "metabolic":
+            return dict(display="flex"), ""
+        if ctx.triggered_id == "metabolic-start" and (problem := metabolic_mode(condition)[2]):
+            return no_update, problem
         return hide, ""
 
-    @app.callback(Output("exp-folder", "children"), Input("exp-name", "value"))
-    def experiment_folder(name):
-        slug = (name or "").strip().replace(" ", "-") or "<name>"
-        return f"saved to {experiments}/{time.strftime('%Y-%m-%d')}-{slug}"
+    @app.callback(
+        Output("metabolic-held", "children"),
+        Input("metabolic", "n_clicks"), Input("metabolic-condition", "value"), prevent_initial_call=True,
+    )
+    def metabolic_preview(_open, condition):
+        """What Start will hold, worked out ahead (the best profile's fit takes seconds), so Start is instant."""
+        folder, payload, problem = metabolic_mode(condition)
+        return problem or f"holds {held_label(payload)}, saved to {os.path.basename(folder)}/metabolic"
 
     @app.callback(
         Output("force-pull-confirm", "displayed"), Output("force-pull-confirm", "message"),
@@ -840,20 +971,29 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             output = (command.output.strip().split("\n") or [""])[-1] if command is not None else ""
             return Status(0, "error", "The controller stopped", output or "Restart it to continue.",
                           "controller-start")
+        if recording_active():
+            return metabolic_status(last, recording["payload"], time.monotonic() - recording["started"])
         if experiment_running():
             return trial_status(last, current, history, segment, settings)
         recent = window["time"] > window["time"][-1] - 2.0 if window else []
         moving = window and any(np.nanmax(np.abs(window[f"velocity_{leg}"][recent])) > MOVING_SPEED for leg in (0, 1))
+        # the experiment can be set up while the gait calibrates
+        configure = None if run["opened"] else "configure"
         if last["stage"] == "calibrating" or (last["stage"] == "standing" and moving):
             return Status(1, "busy", "Keep walking…", "Calibrating the gait: it takes a few strides. The torque "
-                          "stays off until then.")
+                          "stays off until then.", configure)
         if last["stage"] == "standing":
             return Status(1, "action", "Start walking", "The gait is calibrated after a few strides; the torque "
-                          "stays off until then.")
-        process = run["process"]
-        ended = f" The last experiment stopped after {len(history)} trials." if process is not None and history else ""
-        return Status(2, "ready", "Ready to start an experiment",
-                      "The subject keeps walking while profiles are tried, one after the other." + ended, "configure")
+                          "stays off until then.", configure)
+        if not run["opened"]:
+            return Status(2, "ready", "Ready", "Start an experiment: a folder for the subject's settings, "
+                          "optimization trials and metabolic recordings.", "configure")
+        ended = f" The optimization stopped after {len(history)} trials." if run["process"] is not None else ""
+        if run["metabolic"] is not None:
+            ended = " The recording is tagged in the experiment's stream."
+        return Status(2, "ready", os.path.basename(run["exp_dir"]), "Start the optimization, where profiles are tried "
+                      "one after the other while the subject walks, or a metabolic recording, the exo held on one mode."
+                      + ended, "optimize", f"experiment · {len(history)} trials")
 
     def progress_bar(gaits: int, low: int, high: int, reason: str):
         fill = min(gaits / high, 1.0) * 100
@@ -867,7 +1007,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
         ])
 
-    actions = ("configure", "controller-start", "reconnect", "stop")
+    actions = ("configure", "optimize", "metabolic", "close-experiment", "controller-start", "reconnect", "stop")
 
     @app.callback(
         Output("status", "className"), Output("stepper", "children"), Output("hero-eyebrow", "children"),
@@ -876,20 +1016,25 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         Output("controller-log", "children"), Output("console-summary", "children"),
         Output("controller-stop", "disabled"), Output("tiles", "children"),
         Output("session-pill", "children"), Output("experiment-pill", "children"), Output("disconnect", "disabled"),
+        Output("stop", "children"),
         Input("controller-start", "n_clicks"), Input("controller-stop", "n_clicks"),
-        Input("start", "n_clicks"), Input("stop", "n_clicks"), Input("reconnect", "n_clicks"),
-        Input("fast", "n_intervals"),
+        Input("start", "n_clicks"), Input("optimize", "n_clicks"), Input("close-experiment", "n_clicks"),
+        Input("stop", "n_clicks"), Input("reconnect", "n_clicks"),
+        Input("metabolic-start", "n_clicks"), Input("fast", "n_intervals"),
+        State("metabolic-condition", "value"), State("metabolic-label", "value"),
         State("exp-name", "value"), *(State(f"exp-{name}", "value") for name in trials.Settings._fields),
     )
     def status(*args):
         """Act on a click, then render the session from server state (so a dropped response heals on the next tick)."""
-        name, values = args[-1 - len(trials.Settings._fields)], args[-len(trials.Settings._fields):]
+        fields = len(trials.Settings._fields)
+        name, values = args[-1 - fields], args[-fields:]
+        condition, label = args[-3 - fields:-1 - fields]
         if state["session"] is None or state["session"]["name"] is None:
-            return (no_update,) * 17
+            return (no_update,) * 21
         tunnel, trigger = cast(Tunnel, state["tunnel"]), ctx.triggered_id
 
         # clicks: reconnect, the controller, the experiment
-        if trigger == "reconnect" and not experiment_running():
+        if trigger == "reconnect" and not busy():
             controller_name = state["session"]["name"]
             close_session()
             open_session(controller_name)
@@ -908,13 +1053,27 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                 running, state["autostart"] = True, False
         if trigger == "controller-stop" and running:
             command.interrupt()
-        elif trigger == "start" and not experiment_running() and name and name.strip():
+        elif trigger == "start" and not busy() and name and name.strip():
             # a cleared field keeps its default; bo-loop clamps the gait counts
-            options = {k: default if v is None else type(default)(v)
-                       for (k, default), v in zip(defaults._asdict().items(), values)}
-            folder = os.path.join(experiments, f"{time.strftime('%Y-%m-%d')}-{name.strip().replace(' ', '-')}")
-            run.update(process=launch_bo_loop(folder, host, options), started=time.monotonic(), exp_dir=folder,
-                       t0=buffer[-1]["time"] if buffer else None)
+            folder = named_folder(name)
+            trials.save_settings(folder, trials.Settings(*(default if v is None else type(default)(v)
+                                                           for default, v in zip(defaults, values))))
+            run.update(exp_dir=folder, opened=True, process=None, metabolic=None)
+            stream_path["path"] = Path(folder) / "data" / trials.STREAM
+        elif trigger == "close-experiment" and not busy():
+            run.update(opened=False, process=None, metabolic=None)
+            stream_path["path"] = None
+        elif trigger == "optimize" and run["opened"] and not busy():
+            options = trials.load_settings(run["exp_dir"])._asdict()
+            run.update(process=launch_bo_loop(run["exp_dir"], host, options), started=time.monotonic(),
+                       t0=buffer[-1]["time"] if buffer else None, metabolic=None)
+        elif trigger == "metabolic-start" and run["opened"] and not busy():
+            folder, payload, problem = metabolic_mode(condition)
+            if not problem:
+                start_recording(folder, condition, payload, label or "")
+        elif trigger == "stop" and recording_active():
+            # the holding thread releases the exo and tags the stop
+            recording["token"] = None
         elif trigger == "stop" and experiment_running():
             # an interrupt, so bo-loop releases the profile and the torque ramps down
             run["process"].send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
@@ -923,7 +1082,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         data = list(buffer)
         last = data[-1] if data and time.monotonic() - received["at"] < STALE_AFTER else None
         window = columns([x for x in data if x["time"] > data[-1]["time"] - LIVE_WINDOW]) if data else {}
-        current = trials.load_current(run["exp_dir"]) if experiment_running() else None
+        current = trials.load_current(run["exp_dir"]) if busy() else None
         history, settings = load_trials(run["exp_dir"]), trials.load_settings(run["exp_dir"])
         segment = columns([x for x in data if current and x["profile_id"] == current["id"] and x["gain"] >= 1]
                           [settings.warmup:])
@@ -935,7 +1094,9 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             kind = "done" if k < now.step else ("active" if k == now.step else "todo")
             steps.append(html.Li(className=f"step {kind}", children=[
                 html.Span("✓" if kind == "done" else str(k + 1), className="num"), html.Span(step_name)]))
-        shown = lambda id: dict() if id == now.action or (id == "stop" and experiment_running()) else hide
+        offered = {now.action, *(("metabolic", "close-experiment") if now.action == "optimize" else ()),
+                   *(("stop",) if busy() else ())}
+        shown = lambda id: dict() if id in offered else hide
 
         # the controller's shell, folded away
         log = "\n".join(command.output.rstrip("\n").split("\n")[-200:]) if command is not None else ""
@@ -946,13 +1107,13 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
 
         dot = {"error": "error", "busy": "busy"}.get(now.tone, "ok") if now.step or now.tone != "busy" else "busy"
         pill = [html.Span(className=f"dot {dot}"), html.B(state["session"]["name"]), tunnel.target]
-        experiment = [html.Span("experiment"), html.B(os.path.basename(run["exp_dir"]))] \
-            if run["process"] is not None else []
+        experiment = [html.Span("experiment"), html.B(os.path.basename(run["exp_dir"]))] if run["opened"] else []
         return (
             f"status tone-{now.tone}", steps, now.eyebrow or f"step {now.step + 1} of {len(STEPS)}", now.title,
             now.detail, progress_bar(*now.progress) if now.progress else None,
             *(shown(id) for id in actions), log, summary, not running,
-            [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment, experiment_running(),
+            [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment, busy(),
+            "Stop and save the recording" if recording_active() else "Stop optimization",
         )
 
     @app.callback(
@@ -1020,6 +1181,20 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             portrait_figure(trial, p=p),
             trial_summary(trial),
         )
+
+    shown_experiment: dict = dict(key=None)  # what the whole experiment figure shows: redrawn with each new trial
+
+    @app.callback(
+        Output("experiment", "figure"),
+        Input("review-dir", "value"), Input("slow", "n_intervals"), Input("theme", "data"),
+    )
+    def refresh_experiment(folder, _, theme):
+        history, p = load_trials(folder) if folder else [], THEMES.get(theme, LIGHT)
+        key = (folder, theme, tuple(t.index for t in history))
+        if key == shown_experiment["key"] and ctx.triggered_id == "slow":
+            return no_update
+        shown_experiment["key"] = key
+        return experiment_figure(folder, history, p) if folder else placeholder(p, "no experiment", height=LIVE_HEIGHT)
 
     webbrowser.open(f"http://127.0.0.1:{port}")
     app.run(debug=False, port=port)

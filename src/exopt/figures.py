@@ -24,6 +24,10 @@ LEG_LENGTH = 1.0  # animation units
 CLICKABLE = ("loss", "profiles")  # optimization figures, a click selects a trial
 TRIAL = ("profile", "power", "convergence", "portrait")  # figures of the selected trial
 WEB = Path(__file__).with_name("web")
+EXPERIMENT_POINTS = 60_000  # samples at most in the whole experiment figure
+GAP = 1.0  # [s] without samples that breaks the experiment's lines and spans
+REGION_COLORS = {"metabolic": "rgba(60,170,90,0.20)", "ramp": "rgba(214,160,40,0.20)", "full torque, not scored": "rgba(137,135,129,0.18)",
+                 "calibrating": "rgba(140,90,200,0.14)", "standing": "rgba(137,135,129,0.08)"}
 
 
 class Palette(NamedTuple):
@@ -237,6 +241,83 @@ def live_figure(s: dict[str, np.ndarray], p: Palette = LIGHT, stride: int = LIVE
         )
     layout[f"xaxis{len(rows)}"]["title"] = dict(text="controller time (s)")
     return dict(data=data, layout=layout)
+
+
+def experiment_regions(
+    s: dict[str, np.ndarray], history: list[trials.Trial], events: list[tuple[int, dict]], experiment_time: np.ndarray
+) -> list[tuple[str, float, float]]:
+    """Spans of each sample's part of the experiment: a scored trial, a metabolic recording, a torque ramp, unscored
+    full torque, a stage."""
+    gain, stage = s["gain"], s["stage"]
+    labels = np.where(stage != "running", stage, np.where((gain > 0) & (gain < 1), "ramp", np.where(
+        gain >= 1, "full torque, not scored", None))).astype(object)
+    for t in history:
+        scored = (s["profile_id"] == t.samples["profile_id"][0]) & (s["time"] >= t.samples["time"][0]) & (
+            s["time"] <= t.samples["time"][-1])
+        labels[scored] = f"trial {t.index}"
+    starts = [(row, e) for row, e in events if e.get("metabolic") == "start"]
+    stops = [row for row, e in events if e.get("metabolic") == "stop"]
+    for row, event in starts:
+        stop = min((r for r in stops if r >= row), default=len(labels))
+        labels[row:stop] = " ".join(["metabolic", event["condition"], event.get("label", "")]).strip()
+
+    # runs of one label, broken where the recording paused
+    regions, start = [], 0
+    for k in range(1, len(labels) + 1):
+        if k == len(labels) or labels[k] != labels[start] or experiment_time[k] - experiment_time[k - 1] > GAP:
+            if labels[start] is not None:
+                regions.append((labels[start], float(experiment_time[start]), float(experiment_time[k - 1])))
+            start = k
+    return regions
+
+
+def experiment_figure(exp_dir: str, history: list[trials.Trial], p: Palette = LIGHT) -> dict:
+    """Leg signals over the whole experiment, shaded by trial and transition; the trials alone before stream records."""
+    s, events = trials.load_stream(exp_dir, EXPERIMENT_POINTS)
+    recorded = bool(s)
+    if not recorded:
+        if not history:
+            return placeholder(p, "no samples recorded", height=LIVE_HEIGHT).to_plotly_json()
+        keys = [k for k in history[0].samples if k not in ("stage", "profile_id")]
+        s = {k: np.concatenate([t.samples[k] for t in history]).astype(float if k in keys else object)
+             for k in (*keys, "stage", "profile_id")}
+
+    # one clock across controller restarts (each resets its time), the recording's pauses kept
+    raw = s["time"]
+    steps = np.diff(raw, prepend=raw[:1])
+    experiment_time = raw - raw[0] + np.cumsum(np.where(steps < 0, -steps + 0.01, 0.0))
+    regions = experiment_regions(s, history, events, experiment_time)
+    at = np.flatnonzero(np.diff(experiment_time) > GAP) + 1
+    numeric = {k: np.insert(v, at, np.nan) for k, v in s.items() if v.dtype != object} | dict(
+        time=np.insert(experiment_time, at, np.nan))
+
+    fig = live_figure(numeric, p, stride=1)
+    for trace in fig["data"]:
+        trace["type"] = "scattergl"
+    for leg in (0, 1):
+        fig["data"].append(dict(
+            type="scattergl", x=numeric["time"].tolist(), y=numeric[f"measured_torque_{leg}"].tolist(), xaxis="x3",
+            yaxis="y3", mode="lines", name=f"leg {leg} measured", line=dict(color=p.legs[leg], width=1, dash="dot"),
+        ))
+
+    # shaded spans across all rows, trials numbered on top, a legend entry per kind
+    colors = REGION_COLORS | {"trial": p.band}
+    kind = lambda label: next((k for k in ("trial", "metabolic") if label.startswith(k)), label)
+    fig["layout"]["shapes"] = [
+        dict(type="rect", xref="x", yref="paper", x0=x0, x1=x1, y0=0, y1=1, fillcolor=colors.get(kind(label), p.border),
+             line=dict(width=0), layer="below") for label, x0, x1 in regions
+    ]
+    fig["layout"]["annotations"] = [
+        dict(text=label.removeprefix("trial ").removeprefix("metabolic "), x=(x0 + x1) / 2, y=1, xref="x", yref="paper",
+             yanchor="top", showarrow=False, font=dict(size=10, color=p.ink_2))
+        for label, x0, x1 in regions if kind(label) != label
+    ]
+    for label in dict.fromkeys(map(kind, (label for label, *_ in regions))):
+        fig["data"].append(dict(type="scatter", x=[None], y=[None], mode="markers", name=label,
+                                marker=dict(symbol="square", size=12, color=colors.get(label, p.border))))
+    fig["layout"]["xaxis4"]["title"] = dict(text="experiment time (s)" + ("" if recorded else ", scored trials only"))
+    fig["layout"]["margin"]["t"] = 40
+    return fig
 
 
 def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:

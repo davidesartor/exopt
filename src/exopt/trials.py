@@ -2,6 +2,9 @@ from typing import NamedTuple
 from functools import lru_cache
 from pathlib import Path
 import json
+import math
+import threading
+import time
 
 import jax.numpy as jnp
 import numpy as np
@@ -9,6 +12,9 @@ from bofus.rkhs import RBFMixture
 
 BATCHES = 10  # batch means for the standard error of segments with fewer than 2 valid gaits (older trials)
 FULL_CYCLE = 0.95 * 2 * np.pi  # phase span of a complete gait, so a cut one (a segment's first) is left out
+STREAM = "stream.jsonl"  # every sample while the experiment is open: {"keys": [...]} headers, value rows, {"event": {...}}
+STREAM_DECIMALS = 5  # of the recorded values
+STREAM_FLUSH = 1.0  # [s] between writes of the recorded samples, so a crash loses little
 
 
 class Settings(NamedTuple):
@@ -206,6 +212,71 @@ def _read(path: Path, mtime: float, settings: Settings) -> Trial:
     samples = {c: np.asarray(v) for c, v in record["samples"].items()}
     index = int(path.stem.removeprefix("trial"))
     return Trial(index, decode_profile(record), samples, settings, float(record.get("power_assist", 0.0)))
+
+
+class StreamLog:
+    """Appends samples to an experiment's stream file, as value rows under a header of their keys, and tagged events."""
+
+    def __init__(self):
+        self.path, self.out, self.keys, self.flushed = None, None, None, 0.0
+        self.lock = threading.Lock()
+
+    def write(self, path: Path | None, sample: dict) -> None:
+        with self.lock:
+            if self._target(path) is None:
+                return
+            if list(sample) != self.keys:
+                self.keys = list(sample)
+                self.out.write(json.dumps(dict(keys=self.keys)) + "\n")
+            self.out.write(json.dumps([round(v, STREAM_DECIMALS) if isinstance(v, float) else v
+                                       for v in sample.values()]) + "\n")
+            if time.monotonic() - self.flushed > STREAM_FLUSH:
+                self.out.flush()
+                self.flushed = time.monotonic()
+
+    def event(self, path: Path, record: dict) -> None:
+        with self.lock:
+            self._target(path).write(json.dumps(dict(event=record)) + "\n")
+            self.out.flush()
+
+    def _target(self, path: Path | None):
+        if path != self.path:
+            if self.out is not None:
+                self.out.close()
+            self.path, self.keys, self.out = path, None, None
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self.out = path.open("a")
+        return self.out
+
+
+def load_stream(exp_dir: str, max_rows: int) -> tuple[dict[str, np.ndarray], list[tuple[int, dict]]]:
+    """The experiment's samples, thinned to at most max_rows (stage and profile_id as object arrays), and its events,
+    each with the number of rows before it."""
+    try:
+        lines = (Path(exp_dir) / "data" / STREAM).read_text().splitlines()
+    except OSError:
+        return {}, []
+    stride = max(1, math.ceil(len(lines) / max_rows))
+    keys, rows, events = None, [], []
+    for number, line in enumerate(lines):
+        is_tag = line.startswith("{")
+        if not is_tag and number % stride:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:  # a line cut short by a crash
+            continue
+        if is_tag and "keys" in record:
+            keys = record["keys"]
+        elif is_tag:
+            events.append((len(rows), record["event"]))
+        elif keys is not None:
+            rows.append(dict(zip(keys, record)))
+    if not rows:
+        return {}, events
+    objects = {k: np.array([r.get(k) for r in rows], dtype=object) for k in ("stage", "profile_id")}
+    return columns(rows) | objects, events
 
 
 def load(exp_dir: str) -> list[Trial]:

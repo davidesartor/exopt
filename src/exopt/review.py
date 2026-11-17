@@ -11,7 +11,8 @@ import plotly.graph_objects as go
 from plotly.offline import get_plotlyjs
 
 from exopt import trials
-from exopt.figures import (CLICKABLE, DARK, LIGHT, PAGE_CSS, TRIAL, WEB, animation_figure, estimate_figure, loss_figure, portrait_figure,
+from exopt.figures import (CLICKABLE, DARK, LIGHT, PAGE_CSS, TRIAL, WEB, animation_figure, estimate_figure, experiment_figure,
+                           loss_figure, portrait_figure,
                            power_figure, profile_figure, profiles_figure, review_headline, trial_summary)
 
 
@@ -44,7 +45,7 @@ def review_html(exp_dir: str) -> str:
     best = min(range(len(history)), key=lambda k: history[k].loss, default=0)
     data = dict(
         optimization={key: to_json(figure(history, None)) for key, figure in zip(CLICKABLE, optimization)},
-        trials=trial_pages, best=best,
+        trials=trial_pages, best=best, experiment=to_json(experiment_figure(exp_dir, history)),
     )
     # keep "</script>" inside the data from closing its tag
     embed = lambda value: json.dumps(value).replace("</", "<\\/")
@@ -68,6 +69,8 @@ select {{ font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 6px; 
 <div class="controls">
 <span id="summary"></span></div>
 <div class="grid">{graphs(TRIAL[:2], "trial-")}</div><div class="grid">{graphs(TRIAL[2:], "trial-")}</div>
+<h2>whole experiment</h2>
+<div class="grid">{graphs(["experiment"])}</div>
 </div>
 <script type="application/json" id="review-data">{embed(data)}</script>
 <script type="application/json" id="dark-colors">{embed(DARK_COLORS)}</script>
