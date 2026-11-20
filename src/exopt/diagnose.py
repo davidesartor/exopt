@@ -9,6 +9,7 @@ from jaxtyping import Float
 
 from exopt import link
 from exopt.controller import MAX_TORQUE, SAMPLING_STEP
+from exopt.drives import print_registers, print_status_changes
 
 GAIT_PERIOD = 1.1  # [s] of the applied torque, legs half a period apart
 AMPLITUDE = 1.0  # [Nm] of the gait torque, ramped into over the first cycle
@@ -44,13 +45,6 @@ def longest_stall(time_s: Float[np.ndarray, "T"], reads: Float[np.ndarray, "T K"
     return float(np.diff(change_times).max(initial=0.0))
 
 
-def print_status(candle, ids: list[int]) -> None:
-    # quick status where this pyCandle has it: bit 14 set means the drive stage is off
-    for id, md in zip(ids, candle.md80s):
-        if (status := getattr(md, "getQuickStatus", None)) is not None:
-            print(f"  drive {id}: quick status {status():#06x}")
-
-
 if __name__ == "__main__":
     import pyCandle
 
@@ -67,6 +61,7 @@ if __name__ == "__main__":
         if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE) or not candle.controlMd80Enable(id, True):
             sys.exit(f"FAIL: drive {id} refused raw torque mode or enabling")
         md.setMaxTorque(MAX_TORQUE)
+    print_registers(pyCandle, candle, ids, "at start")
     candle.begin()
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, signal.default_int_handler)
@@ -83,12 +78,16 @@ if __name__ == "__main__":
     print(f"applying a {AMPLITUDE:g} Nm, {GAIT_PERIOD} s gait torque, legs in antiphase, until stopped")
     stretch, start = [], time.monotonic()
     next_tick, next_report, longest = start, REPORT_CYCLES * GAIT_PERIOD, 0.0
+    statuses = [None] * len(ids)
     try:
         while True:
             t = time.monotonic() - start
             position = np.array([md.getPosition() for md in candle.md80s])
             velocity = np.array([md.getVelocity() for md in candle.md80s])
             measured = np.array([md.getTorque() for md in candle.md80s])
+
+            print_status_changes(candle.md80s, ids, statuses, t)
+
             gain = min(t / GAIT_PERIOD, 1.0)
             phase = (2 * np.pi * t / GAIT_PERIOD + np.pi * np.arange(2)) % (2 * np.pi)
             commanded = gain * AMPLITUDE * np.sin(phase)
@@ -104,7 +103,6 @@ if __name__ == "__main__":
 
             if t >= next_report:
                 log = np.array(stretch)
-                working = True
                 for leg, id in enumerate(ids):
                     # a drive silent on the bus leaves pyCandle repeating its last reads
                     stall = longest_stall(log[:, 0], log[:, [3 + leg, 5 + leg, 7 + leg]])
@@ -115,11 +113,8 @@ if __name__ == "__main__":
                         outcome = "NO FRESH READS (drive silent on the CAN bus, values are the last ones it sent)"
                     elif stall >= STALL_REPORTED:
                         outcome += f", reads frozen for {stall:.2f} s"
-                    working &= outcome == "ok"
                     print(f"t={t:5.0f} s drive {id}: measured = {fit_gain:+.2f} x commanded {damping:+.2f} "
                           f"x velocity (rms {residual:.2f} Nm), moved {np.ptp(log[:, 7 + leg]):.3f} rad: {outcome}")
-                if not working:
-                    print_status(candle, ids)
                 stretch, next_report = [], next_report + REPORT_CYCLES * GAIT_PERIOD
 
             next_tick = max(next_tick + SAMPLING_STEP, time.monotonic())
@@ -130,5 +125,6 @@ if __name__ == "__main__":
         for md in candle.md80s:
             md.setTargetTorque(0.0)
         candle.end()
+        print_registers(pyCandle, candle, ids, "at stop")
         for id in ids:
             candle.controlMd80Enable(id, False)

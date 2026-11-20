@@ -12,6 +12,7 @@ from einops import rearrange
 from jaxtyping import Bool, Float
 
 from exopt import link
+from exopt.drives import print_registers, print_status_changes
 from exopt.trials import decode_profile
 
 MAX_TORQUE = 13.0  # [Nm] hardware torque limit per motor
@@ -209,6 +210,7 @@ if __name__ == "__main__":
         if not candle.controlMd80Enable(id, True):
             sys.exit(f"failed to enable drive {id}")
         md.setMaxTorque(MAX_TORQUE)
+    print_registers(pyCandle, candle, ids, "at start")
     candle.begin()
 
     # a dropped ssh session ends the run like ctrl-c, so the drives are released
@@ -224,6 +226,7 @@ if __name__ == "__main__":
     start = last_tick = next_tick = idle_since = still_since = time.monotonic()
     standing_pose = None
     stage = None
+    statuses = [None] * len(ids)
 
     # stream samples and apply the requested profiles until ctrl-c, or IDLE_TIMEOUT with nothing connected
     try:
@@ -237,6 +240,7 @@ if __name__ == "__main__":
             raw_position = np.array([md.getPosition() for md in candle.md80s])
             velocity = np.array([md.getVelocity() for md in candle.md80s])
             measured_torque = np.array([md.getTorque() for md in candle.md80s])
+            print_status_changes(candle.md80s, ids, statuses, now - start)
 
             # logged positions are zeroed on the standing pose, re-taken whenever the subject stands still
             if np.any(np.abs(velocity) > STILL_SPEED):
@@ -291,5 +295,6 @@ if __name__ == "__main__":
         for md in candle.md80s:
             md.setTargetTorque(0.0)
         candle.end()
+        print_registers(pyCandle, candle, ids, "at stop")
         for id in ids:
             candle.controlMd80Enable(id, False)
