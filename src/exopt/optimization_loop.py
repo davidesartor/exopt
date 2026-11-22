@@ -45,7 +45,7 @@ def scaled(profile: RBFMixture, intensity: float) -> RBFMixture:
 
 
 def missing_seeds(history: list[experiment.Trial]) -> list[RBFMixture]:
-    """The power assist intensities no trial has measured yet."""
+    """The power assist intensities no trial has measured yet (held runs count)."""
     seeds = [scaled(POWER_ASSIST, intensity) for intensity in SEED_INTENSITIES]
     measured = lambda seed: any(distance(seed, t.profile, periodic=PERIODIC) < 1e-2 for t in history)
     return [seed for seed in seeds if not measured(seed)]
@@ -113,10 +113,33 @@ def posterior_means(key: Key, history: RBFMixture, ys: Float[Array, "n"], y_stds
     return jnp.where(jnp.isfinite(ys), jnp.ravel(mean), jnp.inf)
 
 
+def fitted(history: list[experiment.Trial], settings: experiment.Settings) -> list[experiment.Trial]:
+    """The trials the surrogate learns from: those run on the experiment's power assist, which profiles offset."""
+    return [t for t in history if t.power_assist == settings.power_assist]
+
+
 def best_trial(history: list[experiment.Trial], settings: experiment.Settings) -> experiment.Trial:
     """The trial whose profile has the lowest posterior mean loss."""
     stacked = stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history])
     return history[int(posterior_means(jr.key(settings.seed), *stacked).argmin())]
+
+
+HELD_CHOICES = {"off": "exo off (zero torque)", "assist": "power assist (full intensity)",
+                "best": "best trial (lowest posterior mean loss)", "trial": "a chosen trial"}
+NO_OFFSET = RBFMixture(jnp.ones((1, 1)), jnp.zeros((1, 1)), jnp.zeros(1))
+
+
+def held_profile(exp_dir: str, choice: str, trial: int | None = None) -> tuple[RBFMixture, float, int | None]:
+    """The profile held, its power assist peak, and the trial it repeats (if any)."""
+    if choice == "off":
+        return NO_OFFSET, 0.0, None
+    if choice == "assist":
+        return POWER_ASSIST, 0.0, None
+    history = experiment.load(exp_dir)
+    settings = experiment.load_settings(exp_dir)
+    repeated = best_trial(fitted(history, settings), settings) if choice == "best" else next(
+        t for t in history if t.index == trial)
+    return repeated.profile, repeated.power_assist, repeated.index
 
 
 def compile_ahead(history: list[experiment.Trial], settings: experiment.Settings) -> None:
@@ -221,23 +244,25 @@ def collect_segment(samples: zmq.Socket, profiles: zmq.Socket, payload: dict, se
 def run_session(samples, profiles, exp_dir: str, settings: experiment.Settings) -> None:
     """Propose, ramp up, collect, release, record, until interrupted or the controller is gone."""
     # compiled while the seeds run (they need no surrogate)
-    threading.Thread(target=compile_ahead, args=(experiment.load(exp_dir), settings), daemon=True).start()
+    threading.Thread(target=compile_ahead, args=(fitted(experiment.load(exp_dir), settings), settings), daemon=True).start()
     while True:
-        history = experiment.load(exp_dir)
+        everything = experiment.load(exp_dir)
+        history = fitted(everything, settings)
         profile, best = next_profile(jr.key(settings.seed), history, settings)
 
         # a fresh id per publish, so the controller never mistakes it for a stale profile
-        index = max((t.index for t in history), default=0) + 1
-        payload = experiment.encode_profile(profile) | dict(id=f"{index}-{uuid.uuid4().hex[:6]}",
-                                                        ramp_cycles=settings.ramp_cycles, power_assist=settings.power_assist,
-                                                        stop_rule=best or {})
+        index = max((t.index for t in everything), default=0) + 1
+        payload = experiment.encode_profile(profile) | dict(
+            id=f"{index}-{uuid.uuid4().hex[:6]}", ramp_cycles=settings.ramp_cycles,
+            power_assist=settings.power_assist, stop_rule=best or {})
         experiment.save_current(exp_dir, payload)
         collected, reason = collect_segment(samples, profiles, payload, settings)
         # ramp down to zero while the next proposal is computed
         streams.release(profiles)
         trial = experiment.save(exp_dir, index, profile, collected, settings)
-        best = min([t.loss for t in history] + [trial.loss])
-        print(f"trial {index}: {len(experiment.gait_slices(trial.samples, settings))} valid gaits ({reason}), loss {trial.loss:.4f} ± {trial.se:.4f} (best {best:.4f})")
+        best_loss = min([t.loss for t in history] + [trial.loss])
+        print(f"trial {index}: {len(experiment.gait_slices(trial.samples, settings))} valid gaits ({reason}), "
+              f"loss {trial.loss:.4f} ± {trial.se:.4f} (best {best_loss:.4f})")
 
 
 if __name__ == "__main__":

@@ -174,13 +174,24 @@ class Trial(NamedTuple):
         return gait_estimate(self.samples, self.settings)[1]
 
 
-def save(exp_dir: str, index: int, profile: RBFMixture, samples: list[dict], settings: Settings) -> Trial:
-    """Record a trial's profile, its power assist, and its samples, stored column-wise."""
+def held_segment(samples: list[dict], settings: Settings) -> list[dict]:
+    """A held run's scored part, as collect_segment's: after the warm-up, up to the last gait's end."""
+    segment = samples[settings.warmup:]
+    phases = [s["phase_0"] for s in segment]
+    wraps = [k for k in range(1, len(phases))
+             if None not in (phases[k - 1], phases[k]) and phases[k] - phases[k - 1] < -np.pi]
+    return segment[:wraps[-1]] if wraps else []
+
+
+def save(exp_dir: str, index: int, profile: RBFMixture, samples: list[dict], settings: Settings,
+         power_assist: float | None = None) -> Trial:
+    """Record a trial's profile, its power assist (the settings' unless given), and its samples, stored column-wise."""
+    power_assist = settings.power_assist if power_assist is None else power_assist
     columns = {c: [s[c] for s in samples] for c in samples[0]}
     path = Path(exp_dir) / "data" / f"trial{index}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(encode_profile(profile) | dict(power_assist=settings.power_assist, samples=columns)))
-    return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()}, settings, settings.power_assist)
+    path.write_text(json.dumps(encode_profile(profile) | dict(power_assist=power_assist, samples=columns)))
+    return Trial(index, profile, {c: np.asarray(v) for c, v in columns.items()}, settings, power_assist)
 
 
 def save_current(exp_dir: str, payload: dict) -> None:

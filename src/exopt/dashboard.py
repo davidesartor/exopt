@@ -16,13 +16,14 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 
 import numpy as np
 import paramiko
 import plotly.graph_objects as go
 
-from exopt import experiment, metabolic, streams
+from exopt import experiment, optimization_loop, streams
 from exopt.figures import (CLICKABLE, LIGHT, LIVE_HEIGHT, LIVE_ROWS, LIVE_STRIDE, LIVE_WINDOW, PAGE_CSS, THEMES, TRIAL, WEB, Palette,
                            break_wraps, cycles, estimate_figure, experiment_figure, gait_period, live_figure,
                            load_trials, loss_figure, placeholder, portrait_figure, power_figure, profile_figure,
@@ -133,23 +134,22 @@ def live_tiles(s: dict, last: dict | None, segment: dict, history: list[experime
     return tiles
 
 
-def held_label(payload: dict | None) -> str:
-    """What a metabolic recording holds the exo on."""
-    if payload is None:
-        return "exo off"
-    return "power assist" if payload["trial"] is None else f"best profile (trial {payload['trial']})"
+def held_label(payload: dict) -> str:
+    """What a held run holds the exo on."""
+    repeats = payload["repeats"]
+    return dict(off="exo off", assist="power assist", best=f"best trial ({repeats})",
+                trial=f"trial {repeats}")[payload["choice"]]
 
 
-def metabolic_status(last: dict, payload: dict | None, elapsed: float) -> Status:
-    """The metabolic test's status: recording since Start, the torque ramping to the held profile, or walking stopped."""
-    eyebrow = f"metabolic recording · {held_label(payload)}"
-    clock = f"{int(elapsed // 60)}:{int(elapsed % 60):02d} recorded"
+def held_status(last: dict, payload: dict, elapsed: float) -> Status:
+    """The held run's status: holding since Start, the torque ramping to the held profile, or walking stopped."""
+    eyebrow = f"held run · {held_label(payload)} · becomes trial {payload['index']}"
+    clock = f"{int(elapsed // 60)}:{int(elapsed % 60):02d} held"
     if last["stage"] != "running":
-        return Status(2, "action", "Walking stopped", f"{clock}, still recording. Start walking again to resume.",
-                      "stop", eyebrow)
-    if payload and (last["profile_id"] != payload["id"] or last["gain"] < 1):
+        return Status(2, "action", "Walking stopped", f"{clock}. Start walking again to resume.", "stop", eyebrow)
+    if last["profile_id"] != payload["id"] or last["gain"] < 1:
         return Status(2, "busy", "Ramping up the torque", f"{clock}. Keep walking.", "stop", eyebrow)
-    return Status(2, "ok", "Recording", f"{clock}. Stop when the metabolic measurement ends.", "stop",
+    return Status(2, "ok", "Holding the profile", f"{clock}. Stop to save it as trial {payload['index']}.", "stop",
                   eyebrow)
 
 
@@ -269,8 +269,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     buffer: deque[dict] = deque(maxlen=int(BUFFER_SECONDS / 0.01))
     trajectory: deque[tuple] = deque(maxlen=int(4 * 3600 / 0.01 / TRAJECTORY_STRIDE))
     received = dict(at=-math.inf)
-    # the metabolic test held now, if any: tagged in the experiment's stream
-    recording: dict = dict(token=None, payload=None, started=None)
+    # the held run now, if any, and its samples at full torque: tagged in the experiment's stream, saved as a trial
+    recording: dict = dict(token=None, payload=None, started=None, samples=[])
     # every sample while an experiment is open, stamped with this computer's clock, to its stream file
     stream_log, stream_path = experiment.StreamLog(), dict(path=None)
 
@@ -284,6 +284,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                 buffer.clear()
                 trajectory.clear()
             buffer.append(sample)
+            if recording["payload"] and sample["profile_id"] == recording["payload"]["id"] and sample["gain"] >= 1:
+                recording["samples"].append(sample)
             if count % TRAJECTORY_STRIDE == 0:
                 trajectory.append(tuple(math.nan if sample[k] is None else float(sample[k]) for k in TRAJECTORY_KEYS))
             count += 1
@@ -293,8 +295,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
 
     # the folder and surrogate shown, and the bo-loop launched from the page, if any
     experiments = os.path.dirname(exp_dir) or "."
-    # opened: an experiment is open (its folder exp_dir); metabolic: the last recording's mode
-    run = dict(exp_dir=exp_dir, opened=False, process=None, started=None, t0=None, metabolic=None)
+    # opened: an experiment is open (its folder exp_dir); held: the last held run's outcome
+    run = dict(exp_dir=exp_dir, opened=False, process=None, started=None, t0=None, held=None)
     # the session shown (None: the landing page; name None: review only) and the configure window's state
     state: dict = dict(session=None, tunnel=None, repo=None, autostart=False)
     start_lock = threading.Lock()
@@ -400,22 +402,25 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
         ]),
     ])
-    metabolic_config = html.Div(id="metabolic-config", className="modal", style=hide, children=[
+    held_config = html.Div(id="held-config", className="modal", style=hide, children=[
         html.Div(className="card", children=[
-            html.H3("Metabolic measurement"),
-            html.P("Start the metabolic cart together with Start here. The exo is held on the mode until Stop, which "
-                   "tags its start and stop in the experiment's recorded stream (samples stamped with this computer's clock)."),
+            html.H3("Run a profile"),
+            html.P("The exo holds one profile until Stop (start a metabolic test together with Start here), then the "
+                   "run is saved as the experiment's next trial and tagged in its recorded stream. Runs on the "
+                   "experiment's power assist (exo off, when it is 0) also inform the optimization."),
             html.Div(className="form", children=[
-                field("Mode", dcc.RadioItems(id="metabolic-condition", value="off", options=[
-                    dict(label=f" {label}", value=value) for value, label in metabolic.CONDITIONS.items()]),
-                      html.Span(id="metabolic-held")),
-                field("Label", dcc.Input(id="metabolic-label", placeholder="optional, e.g. pre", style=dict(width="100%")),
-                      "added to the file name, to tell apart tests of the same mode"),
+                field("Profile", dcc.RadioItems(id="held-condition", value="off", options=[
+                    dict(label=f" {label}", value=value) for value, label in optimization_loop.HELD_CHOICES.items()]),
+                      html.Span(id="held-preview")),
+                html.Div(id="held-trial-field", style=hide, children=field(
+                    "Trial", dcc.Dropdown(id="held-trial", clearable=False, placeholder="pick a trial"))),
+                field("Label", dcc.Input(id="held-label", placeholder="optional, e.g. metabolic pre",
+                                         style=dict(width="100%")), "tags the run in the stream"),
             ]),
             html.Div(className="controls", style=dict(marginTop="20px"), children=[
-                html.Button("Start", id="metabolic-start", className="primary"),
-                html.Button("Cancel", id="metabolic-cancel"),
-                html.Span(id="metabolic-note", className="error-text"),
+                html.Button("Start", id="held-start", className="primary"),
+                html.Button("Cancel", id="held-cancel"),
+                html.Span(id="held-note", className="error-text"),
             ]),
         ]),
     ])
@@ -439,7 +444,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                 html.Button("Start experiment", id="configure", className="primary", style=hide),
                 html.Div(className="stack", children=[
                     html.Button("Start optimization", id="optimize", className="primary", style=hide),
-                    html.Button("Metabolic measurement", id="metabolic", className="primary", style=hide),
+                    html.Button("Run a profile", id="held", className="primary", style=hide),
                     html.Button("Close experiment", id="close-experiment", style=hide),
                 ]),
                 html.Button("Restart controller", id="controller-start", className="primary", style=hide),
@@ -491,7 +496,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         ]),
         landing,
         html.Div(id="session", style=hide, children=[status_section, live_section, review_section]),
-        config, metabolic_config, configure_new,
+        config, held_config, configure_new,
         dcc.Store(id="selected"), dcc.Store(id="latest-trial"),
         dcc.Store(id="theme"),
         dcc.ConfirmDialog(id="force-pull-confirm"),
@@ -796,25 +801,43 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     def busy() -> bool:
         return experiment_running() or recording_active()
 
-    def hold(token: object):
-        """Hold the mode (republished each second, the controller ignores repeats), then release and tag the stop."""
+    def hold(token: object, folder: str):
+        """Hold the profile (republished each second, the controller ignores repeats), then release, save the run as
+        a trial (from the warm-up to the last full gait) and tag the stop."""
         path = stream_path["path"]
         while recording["token"] is token:
-            profiles.send_json(recording["payload"] or dict(id=None))
+            profiles.send_json(recording["payload"])
             time.sleep(1.0)
         streams.release(profiles)
-        stream_log.event(path, dict(metabolic="stop", stopped_at=datetime.now().astimezone().isoformat()))
+        payload, settings = recording["payload"], experiment.load_settings(folder)
+        segment = experiment.held_segment(recording["samples"], settings)
+        gaits = len(experiment.gait_slices(experiment.columns(segment), settings)) if segment else 0
+        saved = None
+        if gaits >= 2:
+            experiment.save(folder, payload["index"], experiment.decode_profile(payload), segment, settings,
+                        payload["power_assist"])
+            saved = payload["index"]
+        run.update(held=f"Saved as trial {saved} ({gaits} valid gaits)." if saved else
+                   f"Not saved: {gaits} valid gaits, a trial needs 2.")
+        stream_log.event(path, dict(held="stop", trial=saved, gaits=gaits,
+                                    stopped_at=datetime.now().astimezone().isoformat()))
 
-    def start_recording(folder: str, condition: str, payload: dict | None, label: str):
+    def start_recording(folder: str, choice: str, trial: int | None, label: str):
+        profile, power_assist, repeats = held_mode(choice, trial)[1]
+        settings = experiment.load_settings(folder)
+        index = max((t.index for t in load_trials(folder)), default=0) + 1
+        payload = experiment.encode_profile(profile) | dict(
+            id=f"{index}-{uuid.uuid4().hex[:6]}", ramp_cycles=settings.ramp_cycles, power_assist=power_assist,
+            stop_rule={}, index=index, choice=choice, repeats=repeats, label=label.strip())
         experiment.save_current(folder, payload)
         token = object()
-        recording.update(token=token, payload=payload, started=time.monotonic())
+        recording.update(token=token, payload=payload, started=time.monotonic(), samples=[])
         stream_log.event(stream_path["path"], dict(
-            metabolic="start", condition=condition, label=label.strip(), trial=payload and payload["trial"],
+            held="start", choice=choice, label=label.strip(), trial=index, repeats=repeats,
             profile=payload, started_at=datetime.now().astimezone().isoformat(),
         ))
-        run.update(exp_dir=folder, t0=buffer[-1]["time"] if buffer else None, metabolic=condition)
-        threading.Thread(target=hold, args=(token,), daemon=True).start()
+        run.update(exp_dir=folder, t0=buffer[-1]["time"] if buffer else None, held="")
+        threading.Thread(target=hold, args=(token, folder), daemon=True).start()
 
     def open_session(name: str) -> str:
         """Open a session (a configured controller's: its tunnel, then its controller); why not, if it cannot."""
@@ -888,38 +911,51 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             return f"continues {folder} ({len(load_trials(folder))} trials)", *experiment.load_settings(folder)
         return f"saved to {folder}", *(no_update for _ in experiment.Settings._fields)
 
-    held_payloads: dict[tuple, dict | None] = {}  # per folder, mode and trial count: the best profile takes a fit
+    held_profiles: dict[tuple, tuple] = {}  # per folder, choice, trial and trial count: the best takes a fit
 
-    def metabolic_mode(condition: str) -> tuple[str, dict | None, str]:
-        """The open experiment's folder and the profile a recording holds; else why not."""
+    def held_mode(choice: str, trial: int | None) -> tuple[str, tuple | None, str]:
+        """The open experiment's folder and the profile a held run holds (optimization_loop.held_profile); else why not."""
         folder = run["exp_dir"]
-        count = len(load_trials(folder))
-        if condition == "best" and not count:
-            return None, None, f"{os.path.basename(folder)} has no trials to take the best profile from"
-        if (folder, condition, count) not in held_payloads:
-            held_payloads[folder, condition, count] = metabolic.steady_payload(folder, condition)
-        return folder, held_payloads[folder, condition, count], ""
+        history = load_trials(folder)
+        if choice == "best" and not optimization_loop.fitted(history, experiment.load_settings(folder)):
+            return folder, None, f"{os.path.basename(folder)} has no optimization trials to take the best from"
+        if choice == "trial" and trial not in {t.index for t in history}:
+            return folder, None, "pick a trial"
+        key = (folder, choice, trial if choice == "trial" else None, len(history))
+        if key not in held_profiles:
+            held_profiles[key] = optimization_loop.held_profile(folder, choice, trial)
+        return folder, held_profiles[key], ""
 
     @app.callback(
-        Output("metabolic-config", "style"), Output("metabolic-note", "children"),
-        Input("metabolic", "n_clicks"), Input("metabolic-start", "n_clicks"), Input("metabolic-cancel", "n_clicks"),
-        State("metabolic-condition", "value"), prevent_initial_call=True,
+        Output("held-config", "style"), Output("held-note", "children"),
+        Input("held", "n_clicks"), Input("held-start", "n_clicks"), Input("held-cancel", "n_clicks"),
+        State("held-condition", "value"), State("held-trial", "value"), prevent_initial_call=True,
     )
-    def metabolic_window(_open, _start, _cancel, condition):
-        if ctx.triggered_id == "metabolic":
+    def held_window(_open, _start, _cancel, choice, trial):
+        if ctx.triggered_id == "held":
             return dict(display="flex"), ""
-        if ctx.triggered_id == "metabolic-start" and (problem := metabolic_mode(condition)[2]):
+        if ctx.triggered_id == "held-start" and (problem := held_mode(choice, trial)[2]):
             return no_update, problem
         return hide, ""
 
     @app.callback(
-        Output("metabolic-held", "children"),
-        Input("metabolic", "n_clicks"), Input("metabolic-condition", "value"), prevent_initial_call=True,
+        Output("held-preview", "children"), Output("held-trial-field", "style"), Output("held-trial", "options"),
+        Input("held", "n_clicks"), Input("held-condition", "value"), Input("held-trial", "value"),
+        prevent_initial_call=True,
     )
-    def metabolic_preview(_open, condition):
-        """What Start will hold, worked out ahead (the best profile's fit takes seconds), so Start is instant."""
-        folder, payload, problem = metabolic_mode(condition)
-        return problem or f"holds {held_label(payload)}, saved to {os.path.basename(folder)}/metabolic"
+    def held_preview(_open, choice, trial):
+        """What Start will hold, worked out ahead (the best trial's fit takes seconds), so Start is instant."""
+        folder, profile, problem = held_mode(choice, trial)
+        history = load_trials(folder)
+        options = [dict(label=f"trial {t.index} · loss {t.loss:.3f}", value=t.index) for t in history]
+        trial_style = dict() if choice == "trial" else hide
+        if problem:
+            return problem, trial_style, options
+        _, power_assist, repeats = profile
+        index = max((t.index for t in history), default=0) + 1
+        repeated = f"repeats trial {repeats}, " if repeats is not None else ""
+        fits = "" if power_assist == experiment.load_settings(folder).power_assist else ", kept out of the optimization"
+        return f"{repeated}saved as trial {index}{fits}", trial_style, options
 
     @app.callback(
         Output("force-pull-confirm", "displayed"), Output("force-pull-confirm", "message"),
@@ -972,7 +1008,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             return Status(0, "error", "The controller stopped", output or "Restart it to continue.",
                           "controller-start")
         if recording_active():
-            return metabolic_status(last, recording["payload"], time.monotonic() - recording["started"])
+            return held_status(last, recording["payload"], time.monotonic() - recording["started"])
         if experiment_running():
             return trial_status(last, current, history, segment, settings)
         recent = window["time"] > window["time"][-1] - 2.0 if window else []
@@ -987,12 +1023,12 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
                           "stays off until then.", configure)
         if not run["opened"]:
             return Status(2, "ready", "Ready", "Start an experiment: a folder for the subject's settings, "
-                          "optimization trials and metabolic recordings.", "configure")
+                          "optimization trials and held runs.", "configure")
         ended = f" The optimization stopped after {len(history)} trials." if run["process"] is not None else ""
-        if run["metabolic"] is not None:
-            ended = " The recording is tagged in the experiment's stream."
+        if run["held"] is not None:
+            ended = " " + (run["held"] or "Saving the held run…")
         return Status(2, "ready", os.path.basename(run["exp_dir"]), "Start the optimization, where profiles are tried "
-                      "one after the other while the subject walks, or a metabolic recording, the exo held on one mode."
+                      "one after the other while the subject walks, or run a chosen profile, held until Stop."
                       + ended, "optimize", f"experiment · {len(history)} trials")
 
     def progress_bar(gaits: int, low: int, high: int, reason: str):
@@ -1007,7 +1043,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
         ])
 
-    actions = ("configure", "optimize", "metabolic", "close-experiment", "controller-start", "reconnect", "stop")
+    actions = ("configure", "optimize", "held", "close-experiment", "controller-start", "reconnect", "stop")
 
     @app.callback(
         Output("status", "className"), Output("stepper", "children"), Output("hero-eyebrow", "children"),
@@ -1020,15 +1056,15 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         Input("controller-start", "n_clicks"), Input("controller-stop", "n_clicks"),
         Input("start", "n_clicks"), Input("optimize", "n_clicks"), Input("close-experiment", "n_clicks"),
         Input("stop", "n_clicks"), Input("reconnect", "n_clicks"),
-        Input("metabolic-start", "n_clicks"), Input("fast", "n_intervals"),
-        State("metabolic-condition", "value"), State("metabolic-label", "value"),
+        Input("held-start", "n_clicks"), Input("fast", "n_intervals"),
+        State("held-condition", "value"), State("held-trial", "value"), State("held-label", "value"),
         State("exp-name", "value"), *(State(f"exp-{name}", "value") for name in experiment.Settings._fields),
     )
     def status(*args):
         """Act on a click, then render the session from server state (so a dropped response heals on the next tick)."""
         fields = len(experiment.Settings._fields)
         name, values = args[-1 - fields], args[-fields:]
-        condition, label = args[-3 - fields:-1 - fields]
+        choice, held_trial, label = args[-4 - fields:-1 - fields]
         if state["session"] is None or state["session"]["name"] is None:
             return (no_update,) * 21
         tunnel, trigger = cast(Tunnel, state["tunnel"]), ctx.triggered_id
@@ -1058,21 +1094,21 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             folder = named_folder(name)
             experiment.save_settings(folder, experiment.Settings(*(default if v is None else type(default)(v)
                                                            for default, v in zip(defaults, values))))
-            run.update(exp_dir=folder, opened=True, process=None, metabolic=None)
+            run.update(exp_dir=folder, opened=True, process=None, held=None)
             stream_path["path"] = Path(folder) / "data" / experiment.STREAM
         elif trigger == "close-experiment" and not busy():
-            run.update(opened=False, process=None, metabolic=None)
+            run.update(opened=False, process=None, held=None)
             stream_path["path"] = None
         elif trigger == "optimize" and run["opened"] and not busy():
             options = experiment.load_settings(run["exp_dir"])._asdict()
             run.update(process=launch_optimization(run["exp_dir"], host, options), started=time.monotonic(),
-                       t0=buffer[-1]["time"] if buffer else None, metabolic=None)
-        elif trigger == "metabolic-start" and run["opened"] and not busy():
-            folder, payload, problem = metabolic_mode(condition)
+                       t0=buffer[-1]["time"] if buffer else None, held=None)
+        elif trigger == "held-start" and run["opened"] and not busy():
+            folder, _, problem = held_mode(choice, held_trial)
             if not problem:
-                start_recording(folder, condition, payload, label or "")
+                start_recording(folder, choice, held_trial, label or "")
         elif trigger == "stop" and recording_active():
-            # the holding thread releases the exo and tags the stop
+            # the holding thread releases the exo, saves the trial and tags the stop
             recording["token"] = None
         elif trigger == "stop" and experiment_running():
             # an interrupt, so bo-loop releases the profile and the torque ramps down
@@ -1094,7 +1130,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             kind = "done" if k < now.step else ("active" if k == now.step else "todo")
             steps.append(html.Li(className=f"step {kind}", children=[
                 html.Span("✓" if kind == "done" else str(k + 1), className="num"), html.Span(step_name)]))
-        offered = {now.action, *(("metabolic", "close-experiment") if now.action == "optimize" else ()),
+        offered = {now.action, *(("held", "close-experiment") if now.action == "optimize" else ()),
                    *(("stop",) if busy() else ())}
         shown = lambda id: dict() if id in offered else hide
 
@@ -1113,7 +1149,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             now.detail, progress_bar(*now.progress) if now.progress else None,
             *(shown(id) for id in actions), log, summary, not running,
             [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment_tag, busy(),
-            "Stop and save the recording" if recording_active() else "Stop optimization",
+            "Stop and save the trial" if recording_active() else "Stop optimization",
         )
 
     @app.callback(

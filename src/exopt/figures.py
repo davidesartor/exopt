@@ -26,7 +26,7 @@ TRIAL = ("profile", "power", "convergence", "portrait")  # figures of the select
 WEB = Path(__file__).with_name("web")
 EXPERIMENT_POINTS = 60_000  # samples at most in the whole experiment figure
 GAP = 1.0  # [s] without samples that breaks the experiment's lines and spans
-REGION_COLORS = {"metabolic": "rgba(60,170,90,0.20)", "ramp": "rgba(214,160,40,0.20)", "full torque, not scored": "rgba(137,135,129,0.18)",
+REGION_COLORS = {"held": "rgba(60,170,90,0.20)", "ramp": "rgba(214,160,40,0.20)", "full torque, not scored": "rgba(137,135,129,0.18)",
                  "calibrating": "rgba(140,90,200,0.14)", "standing": "rgba(137,135,129,0.08)"}
 
 
@@ -246,7 +246,7 @@ def live_figure(s: dict[str, np.ndarray], p: Palette = LIGHT, stride: int = LIVE
 def experiment_regions(
     s: dict[str, np.ndarray], history: list[experiment.Trial], events: list[tuple[int, dict]], experiment_time: np.ndarray
 ) -> list[tuple[str, float, float]]:
-    """Spans of each sample's part of the experiment: a scored trial, a metabolic recording, a torque ramp, unscored
+    """Spans of each sample's part of the experiment: a scored trial, a held run (also a trial), a torque ramp, unscored
     full torque, a stage."""
     gain, stage = s["gain"], s["stage"]
     labels = np.where(stage != "running", stage, np.where((gain > 0) & (gain < 1), "ramp", np.where(
@@ -255,11 +255,11 @@ def experiment_regions(
         scored = (s["profile_id"] == t.samples["profile_id"][0]) & (s["time"] >= t.samples["time"][0]) & (
             s["time"] <= t.samples["time"][-1])
         labels[scored] = f"trial {t.index}"
-    starts = [(row, e) for row, e in events if e.get("metabolic") == "start"]
-    stops = [row for row, e in events if e.get("metabolic") == "stop"]
-    for row, event in starts:
-        stop = min((r for r in stops if r >= row), default=len(labels))
-        labels[row:stop] = " ".join(["metabolic", event["condition"], event.get("label", "")]).strip()
+    held = [(row, e) for row, e in events if e.get("held") in ("start", "stop")]
+    for k, (row, event) in enumerate(held):
+        if event["held"] == "start":
+            stop = held[k + 1][0] if k + 1 < len(held) else len(labels)
+            labels[row:stop] = " ".join(["held", str(event["trial"]), event["choice"], event.get("label", "")]).strip()
 
     # runs of one label, broken where the recording paused
     regions, start = [], 0
@@ -302,13 +302,13 @@ def experiment_figure(exp_dir: str, history: list[experiment.Trial], p: Palette 
 
     # shaded spans across all rows, trials numbered on top, a legend entry per kind
     colors = REGION_COLORS | {"trial": p.band}
-    kind = lambda label: next((k for k in ("trial", "metabolic") if label.startswith(k)), label)
+    kind = lambda label: next((k for k in ("trial", "held") if label.startswith(k)), label)
     fig["layout"]["shapes"] = [
         dict(type="rect", xref="x", yref="paper", x0=x0, x1=x1, y0=0, y1=1, fillcolor=colors.get(kind(label), p.border),
              line=dict(width=0), layer="below") for label, x0, x1 in regions
     ]
     fig["layout"]["annotations"] = [
-        dict(text=label.removeprefix("trial ").removeprefix("metabolic "), x=(x0 + x1) / 2, y=1, xref="x", yref="paper",
+        dict(text=label.removeprefix("trial ").removeprefix("held "), x=(x0 + x1) / 2, y=1, xref="x", yref="paper",
              yanchor="top", showarrow=False, font=dict(size=10, color=p.ink_2))
         for label, x0, x1 in regions if kind(label) != label
     ]
