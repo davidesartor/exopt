@@ -39,7 +39,7 @@ class Peers:
 
 
 def driver_link(host: str = "localhost") -> tuple[zmq.Socket, zmq.Socket]:
-    """Laptop side: connect a SUB for samples in and a PUB for profiles out (the Pi's ports are forwarded here, tunnel.Tunnel)."""
+    """Laptop side: connect a SUB for samples in and a PUB for profiles out (the Pi's ports are forwarded here, raspberrypi.Tunnel)."""
     ctx = zmq.Context.instance()
     samples = ctx.socket(zmq.SUB)
     # heartbeat so a controller restart behind the ssh tunnel drops and reconnects the link

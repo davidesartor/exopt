@@ -8,35 +8,27 @@ import argparse
 import json
 import math
 import os
-import posixpath
-import shlex
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
 import webbrowser
 
 import numpy as np
-import paramiko
 import plotly.graph_objects as go
 
-from exopt import experiment, optimization_loop, streams
+from exopt import experiment, optimization_loop, raspberrypi, streams
 from exopt.figures import (CLICKABLE, LIGHT, LIVE_HEIGHT, LIVE_ROWS, LIVE_STRIDE, LIVE_WINDOW, PAGE_CSS, THEMES, TRIAL, WEB, Palette,
                            break_wraps, cycles, estimate_figure, experiment_figure, gait_period, live_figure,
                            load_trials, loss_figure, placeholder, portrait_figure, power_figure, profile_figure,
                            profiles_figure, review_headline, trial_summary)
-from exopt.tunnel import (SSH_CONFIG, Tunnel, delete_controller, known_hosts, save_controller, save_host,
-                          saved_controllers)
 
 columns = experiment.columns
 BUFFER_SECONDS = 60.0  # [s] of samples kept at full rate
 TORQUE_WINDOW = 4.0  # [s] of live torque overlaid on the applied profile
-NEW = "::new"  # the controller picker's configure new entry
-REPO = Path(__file__).resolve().parents[2]
-CONTROLLER, MOCK_CONTROLLER, DIAGNOSE = "src/exopt/control_loop.py", "src/exopt/drives_mock.py", "src/exopt/diagnose.py"
+CONTROLLER, MOCK, DIAGNOSE = "src/exopt/control_loop.py", "src/exopt/drives_mock.py", "src/exopt/diagnose.py"
 REFRESH_MS = 1000  # live band refresh period (1 Hz)
 FEED_MS = 1000 / 60  # live traces and segment estimate pulled and drawn at 60 Hz
 FEED_POINTS = int((LIVE_WINDOW + 1.0) / 0.01 / LIVE_STRIDE)  # kept per trace by the page
@@ -153,119 +145,22 @@ def held_status(last: dict, payload: dict, elapsed: float) -> Status:
                   eyebrow)
 
 
-def launch_optimization(exp_dir: str, host: str, options: dict) -> subprocess.Popen:
+def launch_optimization(exp_dir: str, options: dict) -> subprocess.Popen:
     """Start a bo-loop session in the background, logging to <exp_dir>/data/bo-loop.log."""
     os.makedirs(os.path.join(exp_dir, "data"), exist_ok=True)
     flags = [arg for name, value in options.items() for arg in (f"--{name.replace('_', '-')}", str(value))]
-    command = [sys.executable, "-u", "-m", "exopt.optimization_loop", "--exp-dir", exp_dir, "--host", host, *flags]
+    command = [sys.executable, "-u", "-m", "exopt.optimization_loop", "--exp-dir", exp_dir, *flags]
     with open(os.path.join(exp_dir, "data", "bo-loop.log"), "a") as log:
         # its own process group on Windows, so a ctrl-break reaches it alone
         group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else {}
         return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **group)
 
 
-def git(*args: str, timeout: float = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True, timeout=timeout,
-                          env=os.environ | dict(GIT_TERMINAL_PROMPT="0"))
-
-
-# a force pull keeps local commits on a branch and uncommitted changes in the stash
-BACKUP_BRANCH = "pre-force-pull"
-FORCE_PULL = (("branch", "-f", BACKUP_BRANCH), ("stash",), ("reset", "--hard", "@{u}"))
-FORCE_PUSHED = (*FORCE_PULL[:-1], ("reset", "--hard", "FETCH_HEAD"))  # the host, to the commits sent it
-FORCE_PULL_NOTE = f"Local commits stay on the branch {BACKUP_BRANCH}, uncommitted changes in git stash."
-PULL_REFUSED = 75  # the host's checkout can't fast-forward: its exit status, so the page asks to force pull
-
-
-def last_line(done: subprocess.CompletedProcess) -> str:
-    return ((done.stderr or done.stdout).strip().splitlines() or [f"exit {done.returncode}"])[-1]
-
-
-def ask_force_pull(reason: str) -> bool:
-    if not sys.stdin.isatty():
-        return False
-    print(f"This checkout can't fast-forward to origin ({reason}).\n{FORCE_PULL_NOTE}")
-    return input("Force pull, resetting it to origin? [y/N] ").strip().lower() in ("y", "yes")
-
-
-def update_checkout() -> tuple[str | None, bool, str | None]:
-    """Pull this checkout, offering a force pull if it diverged: its remote's url, whether new commits came in,
-    and why the pull failed, if it did."""
-    try:
-        before = git("rev-parse", "HEAD").stdout
-        remote = git("remote", "get-url", "origin").stdout.strip() or None
-        if (fetched := git("fetch")).returncode:
-            return remote, False, f"git fetch failed: {last_line(fetched)}"
-        if (merged := git("merge", "--ff-only", "@{u}")).returncode:
-            if not ask_force_pull(last_line(merged)):
-                return remote, False, f"git pull failed: {last_line(merged)}"
-            for args in FORCE_PULL:
-                if (done := git(*args)).returncode:
-                    return remote, False, f"force pull failed (git {args[0]}): {last_line(done)}"
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return None, False, f"git pull failed: {error}"
-    return remote, git("rev-parse", "HEAD").stdout != before, None
-
-
-def send_commits(tunnel: Tunnel, repo: str) -> tuple[str | None, str | None]:
-    """Upload the commits the host's checkout lacks from this one as a git bundle, so the host needs no internet:
-    the bundle's path there (None if it lacks nothing), and why sending failed, if it did."""
-    try:
-        theirs = tunnel.execute(f"git -C {shlex.quote(repo)} rev-parse --verify -q HEAD").strip()
-        ours = git("rev-parse", "HEAD").stdout.strip()
-        known = bool(theirs) and git("cat-file", "-e", f"{theirs}^{{commit}}").returncode == 0
-        if theirs == ours or (known and git("merge-base", "--is-ancestor", "HEAD", theirs).returncode == 0):
-            return None, None
-        # only what the host lacks when this checkout knows its HEAD, else everything (a clone)
-        branch = git("symbolic-ref", "-q", "HEAD").stdout.strip()
-        revs = [f"{theirs}..HEAD"] if known else ["HEAD", *([branch] if branch else [])]
-        fd, local = tempfile.mkstemp(suffix=".bundle")
-        os.close(fd)
-        try:
-            if (bundled := git("bundle", "create", local, *revs)).returncode:
-                return None, f"git bundle failed: {last_line(bundled)}"
-            return tunnel.upload(local, "exopt.bundle"), None
-        finally:
-            os.remove(local)
-    except (OSError, subprocess.TimeoutExpired, paramiko.SSHException) as error:
-        return None, f"sending commits failed: {error}"
-
-
-def controller_command(repo: str, bundle: str | None, remote: str | None, script: str, pull: str = "pull",
-                       warning: str | None = None) -> str:
-    """Shell command bringing the host's checkout to this one's commits from a bundle (cloning it if missing),
-    then running a controller script in it.
-
-    pull: "pull" exits with PULL_REFUSED if it can't fast-forward, "force" resets it, "skip" runs it as is."""
-    folder = shlex.quote(repo)
-    in_repo = lambda *args: f"git -C {folder} {shlex.join(args)}"
-    clone = f"echo {shlex.quote(f'no commits to clone exopt from: {warning}')}; false"
-    if bundle:
-        set_origin = f" && {in_repo('remote', 'set-url', 'origin', remote)}" if remote else ""
-        clone = f"git clone {shlex.quote(bundle)} {folder}{set_origin}"
-    update = {
-        "pull": f"{in_repo('merge', '--ff-only', 'FETCH_HEAD')} || exit {PULL_REFUSED}",
-        "force": " && ".join(in_repo(*args) for args in FORCE_PUSHED)
-                 + " || echo 'warning: force update failed, running the checkout as it is'",
-        "skip": "echo 'running the checkout as it is'",
-    }[pull]
-    fetch = (f"if {in_repo('fetch', '-q', bundle, 'HEAD')}; then {update}; "
-             f"else echo 'warning: git fetch from the bundle failed, running the checkout as it is'; fi"
-             if bundle and pull != "skip" else "true")
-    return (f'export GIT_TERMINAL_PROMPT=0 PATH="$HOME/.local/bin:$PATH"; '
-            + (f"echo {shlex.quote(f'warning: {warning}, running the checkout as it is')}; " if warning else "")
-            + f"if [ -d {folder}/.git ]; then {fetch}; else {clone} || exit 1; fi; "
-            # no project build: it needs hatchling from PyPI, and the host may be offline
-            f"cd {folder} && uv sync -q --frozen --inexact --no-install-project --group controller && "
-            f"PYTHONPATH=src exec uv run --no-sync python {shlex.quote(script)}")
-
-
-def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int], atoms: int, script: str,
-                  remote: str | None, warning: str | None):
-    from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
+def run_dashboard(exp_dir: str, port: int, atoms: int, script: str):
+    from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
     # drain the controller's sample stream from a background thread: a rolling buffer, and a thinned whole record
-    stream, profiles = streams.driver_link(host)
+    stream, profiles = streams.driver_link()
     buffer: deque[dict] = deque(maxlen=int(BUFFER_SECONDS / 0.01))
     trajectory: deque[tuple] = deque(maxlen=int(4 * 3600 / 0.01 / TRAJECTORY_STRIDE))
     received = dict(at=-math.inf)
@@ -297,11 +192,10 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     experiments = os.path.dirname(exp_dir) or "."
     # opened: an experiment is open (its folder exp_dir); held: the last held run's outcome
     run = dict(exp_dir=exp_dir, opened=False, process=None, started=None, t0=None, held=None)
-    # the session shown (None: the landing page; name None: review only) and the configure window's state
-    state: dict = dict(session=None, tunnel=None, repo=None, autostart=False)
+    # the session shown (None: the landing page; name None: review only); hotspot: the Pi's wifi is its own network
+    state: dict = dict(session=None, tunnel=None, autostart=False, hotspot=None)
     start_lock = threading.Lock()
-    repo_name = posixpath.basename(remote or "exopt").removesuffix(".git")
-    wizard: dict = dict(step=0, tunnel=None, host=None, fresh=False, editing=None)
+    mock = script == MOCK
 
     tile = lambda label, value, sub: html.Div(className="tile", children=[
         html.Div(label, className="label"), html.Div(value, className="value"), html.Div(sub, className="sub"),
@@ -310,7 +204,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     grid = lambda *ids: html.Div(className="grid", children=[graph(id) for id in ids])
     app = Dash(__name__, title="exopt", update_title=None)
     app.index_string = app.index_string.replace("{%css%}", "{%css%}<style>" + PAGE_CSS + "</style>")
-    labeled = lambda label, field: html.Span([label, " ", field])
     field = lambda label, control, help="": html.Div(className="field", children=[
         html.Label(label), control, html.Div(help, className="help") if help else None])
     number = lambda id, value, width, **kw: dcc.Input(id=id, type="number", value=value, style=dict(width=width), **kw)
@@ -321,65 +214,26 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         default = getattr(defaults, name)
         step = 1 if isinstance(default, int) else "any"
         return field(label, number(f"exp-{name}", default, "100%", min=0, step=step), hint or "")
-    exo_host, exo_user, exo_port = exo
-    dropdown = lambda id, width, **kw: dcc.Dropdown(id=id, clearable=False, style=dict(
-        width=width, display="inline-block", verticalAlign="middle"), **kw)
     hide = dict(display="none")
+    saved = raspberrypi.load_settings()
     landing = html.Div(id="landing", className="landing", children=html.Div(className="card", children=[
         html.H3("Connect to the exoskeleton"),
-        html.P("Pick a controller and connect. To add one, choose “+ configure new” in the list."),
-        dropdown("controller-pick", "100%", placeholder="configure a controller"),
-        html.Div(className="controls", style=dict(marginTop="16px"), children=[
+        html.P("Simulated legs, run on this computer." if mock else
+               "Over the lab wifi, the Pi's own wifi exo-pi, or a USB-C cable: whichever answers."),
+        html.Div(className="controls", children=[
             html.Button("Connect", id="connect", className="primary"),
-            html.Button("Edit", id="edit-controller", style=hide), html.Button("Delete", id="delete-controller", style=hide),
-            html.Span(id="landing-note"),
+            html.Button("Review finished experiments", id="review-only"),
         ]),
-        html.Div(className="controls", children=html.Button("Review finished experiments", id="review-only")),
-        dcc.ConfirmDialog(id="delete-confirm"),
+        html.Details(className="advanced", style=hide if mock else {}, children=[
+            html.Summary("Settings"),
+            html.Div(className="form", children=[
+                field("Address on the lab wifi", dcc.Input(id="pi-wifi", value=saved["wifi"], style=dict(width="100%")),
+                      f"default {raspberrypi.ROUTES['wifi']}"),
+                field("Password", dcc.Input(id="pi-password", type="password", value=saved["password"],
+                                            style=dict(width="100%")), f"of the Pi's user {raspberrypi.USER}"),
+            ]),
+        ]),
     ]))
-    configure_new = html.Div(id="wizard", className="modal", style=hide, children=[
-        html.Div(className="card", children=[
-            html.H3("Configure a controller", id="wizard-title"),
-            html.Div(id="wizard-ssh", children=[
-                html.P("1 / 3 · ssh host: the machine running the controller."),
-                dcc.RadioItems(id="add-source", value="config", inline=True, options=[
-                    dict(label=" from ssh config  ", value="config"), dict(label=" manually", value="manual")]),
-                html.Div(id="from-config", className="controls", children=[
-                    labeled("host", dropdown("config-alias", "320px", placeholder="a host of ~/.ssh/config")),
-                ]),
-                # saved to ~/.ssh/config; an existing name gets the new address (the Pi's changes with DHCP)
-                html.Div(id="from-manual", className="controls", children=[
-                    dcc.Input(id="new-name", placeholder="name", style=dict(width="120px")),
-                    labeled("address", dcc.Input(id="new-address", value=exo_host, style=dict(width="160px"))),
-                    labeled("user", dcc.Input(id="new-user", value=exo_user, style=dict(width="90px"))),
-                    labeled("port", number("new-port", exo_port, "80px", min=1)),
-                ]),
-                # written to the host's ssh config entry as Password; blank keeps the current one, or ssh keys
-                html.Div(className="controls", children=[
-                    labeled("password", dcc.Input(id="new-password", type="password",
-                                                  placeholder="blank: ssh key or unchanged", style=dict(width="220px"))),
-                ]),
-            ]),
-            html.Div(id="wizard-repo", style=hide, children=[
-                html.P("2 / 3 · where exopt lives on the host: a checkout there is pulled on each connect, "
-                       "else it is cloned there."),
-                html.Div(className="controls", children=[
-                    html.Button("↑", id="browse-up", title="parent folder"),
-                    html.Span(id="browse-path", className="path"),
-                ]),
-                html.Div(id="browse-list", className="browser"),
-                html.Div(className="controls", children=html.Span(id="repo-label")),
-            ]),
-            html.Div(id="wizard-name", style=hide, children=[
-                html.P("3 / 3 · nickname, under which this host and folder are saved."),
-                html.Div(className="controls", children=dcc.Input(id="nickname", style=dict(width="220px"))),
-            ]),
-            html.Div(className="controls", style=dict(marginTop="12px"), children=[
-                html.Button("Back", id="wizard-back"), html.Button("Next", id="wizard-next", className="primary"),
-                html.Button("Cancel", id="wizard-cancel"), html.Span(id="wizard-note"),
-            ]),
-        ]),
-    ])
     config = html.Div(id="config", className="modal", style=hide, children=[
         html.Div(className="card", children=[
             html.H3("New experiment"),
@@ -424,7 +278,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
         ]),
     ])
-    # the controller's terminal on the host, streamed live beside the status
+    # the controller's terminal, streamed live beside the status
     console = html.Div(className="console", children=[
         html.Div(id="console-summary", className="console-head"),
         html.Div(className="log-scroll", children=html.Pre(id="controller-log", className="log")),
@@ -490,18 +344,17 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             html.Span("exopt", className="brand"),
             html.Span(id="session-pill", className="pill", style=hide),
             html.Span(id="experiment-pill", className="pill", style=hide),
-            html.Span(warning, className="pill warn") if warning else None,
             html.Span(className="spacer"),
+            # over wifi the switch drops the connection: reconnect once this computer joined the other network
+            dcc.ConfirmDialogProvider(id="wifi-switch", children=html.Button(id="wifi-switch-label")),
             html.Button("Disconnect", id="disconnect", style=hide),
         ]),
         landing,
         html.Div(id="session", style=hide, children=[status_section, live_section, review_section]),
-        config, held_config, configure_new,
+        config, held_config,
         dcc.Store(id="selected"), dcc.Store(id="latest-trial"),
         dcc.Store(id="theme"),
-        dcc.ConfirmDialog(id="force-pull-confirm"),
         dcc.Store(id="live-loop"),
-        dcc.Store(id="browse-dir"), dcc.Store(id="repo"), dcc.Store(id="ssh-checked"),
         dcc.Interval(id="fast", interval=REFRESH_MS),
         dcc.Interval(id="slow", interval=2500),
     ])
@@ -612,186 +465,6 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         Input("fast", "n_intervals"), State("theme", "data"),
     )
 
-    def picker_options() -> list[dict]:
-        known = known_hosts()
-        options = []
-        for c in saved_controllers():
-            h = known.get(c["host"])
-            where = f"{h['user']}@{h['hostname']}" if h else f"host {c['host']} missing from {SSH_CONFIG}"
-            options.append(dict(label=f"{c['name']} · {where} · {c['repo']}", value=c["name"]))
-        return [*options, dict(label="+ configure new", value=NEW)]
-
-    def close_wizard_tunnel():
-        if wizard["tunnel"] is not None:
-            wizard["tunnel"].close()
-        wizard["tunnel"] = None
-
-    @app.callback(Output("ssh-checked", "data"), Input("fast", "n_intervals"))
-    def ssh_checked(_):
-        """The configure window's ssh check finishing, apart from its clicks so a poll never overtakes one."""
-        checking = cast(Tunnel | None, wizard["tunnel"])
-        done = wizard["step"] == 1 and checking is not None and (checking.connected or checking.error)
-        return time.monotonic() if done else no_update
-
-    @app.callback(
-        Output("controller-pick", "options"), Output("controller-pick", "value"), Output("wizard", "style"),
-        Output("wizard-ssh", "style"), Output("wizard-repo", "style"), Output("wizard-name", "style"),
-        Output("wizard-back", "style"), Output("wizard-next", "children"), Output("wizard-note", "children"),
-        Output("nickname", "value"), Output("new-password", "value"), Output("config-alias", "options"),
-        Output("config-alias", "value"), Output("add-source", "value"), Output("wizard-title", "children"),
-        Input("controller-pick", "value"), Input("wizard-next", "n_clicks"), Input("wizard-back", "n_clicks"),
-        Input("wizard-cancel", "n_clicks"), Input("ssh-checked", "data"), Input("edit-controller", "n_clicks"),
-        Input("delete-confirm", "submit_n_clicks"),
-        State("add-source", "value"), State("config-alias", "value"), State("new-name", "value"),
-        State("new-address", "value"), State("new-user", "value"), State("new-port", "value"),
-        State("new-password", "value"), State("repo", "data"), State("nickname", "value"),
-    )
-    def configure(picked, _next, _back, _cancel, _, _edit, _delete, source, config_alias, name, address, user, port,
-                  password, repo, nickname):
-        """The configure window: 1 ssh host (connected to check it), 2 exopt folder, 3 nickname, then saved."""
-        trigger, step, note = ctx.triggered_id, wizard["step"], ""
-        value = nick = password_field = alias_field = source_field = no_update
-        connecting = cast(Tunnel | None, wizard["tunnel"])
-        last_used = next((c["name"] for c in saved_controllers()), None)
-        if trigger is None:
-            value = last_used
-        elif trigger == "ssh-checked":
-            if step != 1 or connecting is None or not (connecting.connected or connecting.error):
-                return (no_update,) * 15
-            if connecting.connected:
-                wizard.update(step=2, fresh=True)
-            else:
-                note = f"ssh to {connecting.target} failed: {connecting.error}"
-                wizard["tunnel"] = None
-        elif trigger == "controller-pick" and picked == NEW:
-            close_wizard_tunnel()
-            wizard.update(step=1, host=None, editing=None)
-            value, password_field = last_used, ""
-        elif trigger == "edit-controller" and picked not in (None, NEW):
-            close_wizard_tunnel()
-            edited = next(c for c in saved_controllers() if c["name"] == picked)
-            wizard.update(step=1, host=None, editing=picked)
-            password_field, alias_field, source_field = "", edited["host"], "config"
-        elif trigger == "delete-confirm" and picked not in (None, NEW):
-            delete_controller(picked)
-            value = next((c["name"] for c in saved_controllers()), None)
-        elif trigger == "wizard-cancel":
-            close_wizard_tunnel()
-            wizard.update(step=0, editing=None)
-        elif trigger == "wizard-back" and step > 1:
-            if step == 2:
-                close_wizard_tunnel()
-            wizard["step"] = step - 1
-        elif trigger == "wizard-next" and step == 1 and connecting is None:
-            alias = config_alias if source == "config" else (name or "").strip()
-            if source == "config" and not alias:
-                note = "pick a host"
-            elif source == "manual" and not (alias and address and address.strip() and user and user.strip() and port):
-                note = "name, address, user and port are needed"
-            elif source == "manual" and any(c in alias for c in " *?!"):
-                note = "the name cannot hold spaces or * ? !"
-            else:
-                try:
-                    if source == "manual":
-                        save_host(alias, address.strip(), user.strip(), int(port), password or None)
-                    elif password:
-                        save_host(alias, password=password)
-                    h = known_hosts()[alias]
-                except (OSError, KeyError) as error:
-                    note = f"could not write {SSH_CONFIG}: {error}"
-                else:
-                    connecting = Tunnel(h["hostname"], h["user"], h["port"], h["password"], (), tuple(h["keys"]))
-                    wizard.update(host=alias, tunnel=connecting)
-                    note = f"connecting to {connecting.target}…"
-        elif trigger == "wizard-next" and step == 2:
-            if repo:
-                wizard["step"], nick = 3, wizard["editing"] or wizard["host"]
-            else:
-                note = "open the folder exopt lives in"
-        elif trigger == "wizard-next" and step == 3:
-            nickname = (nickname or "").strip()
-            if not nickname or nickname.startswith("::"):
-                note = "a nickname is needed"
-            elif not repo:
-                note = "no folder for exopt: go back to pick it"
-            else:
-                if wizard["editing"] not in (None, nickname):
-                    delete_controller(wizard["editing"])  # renamed
-                save_controller(nickname, wizard["host"], repo)
-                close_wizard_tunnel()
-                wizard.update(step=0, editing=None)
-                value = nickname
-
-        step = wizard["step"]
-        shown = lambda s: dict() if step == s else hide
-        others = [dict(label=f"{a} · {h['user']}@{h['hostname']}", value=a) for a, h in known_hosts().items()]
-        return (picker_options(), value, dict(display="flex") if step else hide, shown(1), shown(2), shown(3),
-                dict() if step > 1 else hide, "Save" if step == 3 else "Next", note, nick, password_field, others,
-                alias_field, source_field, f"Edit {wizard['editing']}" if wizard["editing"] else "Configure a controller")
-
-    @app.callback(
-        Output("edit-controller", "style"), Output("delete-controller", "style"), Input("controller-pick", "value"),
-    )
-    def picked_actions(picked):
-        """Edit and delete only for a configured controller."""
-        return (hide, hide) if picked in (None, NEW) else (dict(), dict())
-
-    @app.callback(
-        Output("delete-confirm", "displayed"), Output("delete-confirm", "message"),
-        Input("delete-controller", "n_clicks"), State("controller-pick", "value"), prevent_initial_call=True,
-    )
-    def confirm_delete(_, picked):
-        return True, f"Forget the controller {picked}? Its ssh host and the host's checkout stay."
-
-    @app.callback(Output("from-config", "style"), Output("from-manual", "style"), Input("add-source", "value"))
-    def add_source(source):
-        return (dict(), hide) if source == "config" else (hide, dict())
-
-    @app.callback(
-        Output("browse-dir", "data"), Output("browse-list", "children"), Output("browse-path", "children"),
-        Output("repo", "data"), Output("repo-label", "children"),
-        Input("wizard-repo", "style"), Input("browse-up", "n_clicks"), Input(dict(entry=ALL), "n_clicks"),
-        State("browse-dir", "data"),
-    )
-    def browse(card, _up, _entries, folder):
-        """The host's folders over sftp: the one open holds exopt's checkout, or gets it cloned in."""
-        current = cast(Tunnel | None, wizard["tunnel"])
-        trigger = ctx.triggered_id
-        if card.get("display") == "none" or current is None or not current.connected:
-            return (no_update,) * 5
-        if wizard["fresh"]:
-            wizard["fresh"], folder = False, None
-        # a listing exists already: only clicks change it (freshly listed entries fire with no clicks)
-        elif trigger in (None, "wizard-repo") or not ctx.triggered[0]["value"]:
-            return (no_update,) * 5
-
-        # start in the edited controller's checkout, else one on the same host, else the home folder
-        if folder is None:
-            saved = saved_controllers()
-            known = [c["repo"] for c in saved if c["host"] == wizard["host"] and c["name"] == wizard["editing"]] + \
-                    [c["repo"] for c in saved if c["host"] == wizard["host"]]
-            target = known[0] if known else "."
-        elif trigger == "browse-up":
-            target = posixpath.dirname(folder.rstrip("/")) or "/"
-        else:
-            target = posixpath.join(folder, trigger["entry"])
-        try:
-            folder, entries = current.browse(target)
-        except OSError as error:
-            try:
-                if folder is not None or target == ".":
-                    raise
-                folder, entries = current.browse(".")  # that folder is gone
-            except OSError:
-                return no_update, no_update, f"{target}: {error}", no_update, no_update
-
-        # the open folder if it is a checkout, else exopt's folder in it
-        checkout = lambda path: current.exists(posixpath.join(path, ".git"))
-        repo = folder if checkout(folder) else posixpath.join(folder, repo_name)
-        label = f"{repo}: pulled on each connect" if checkout(repo) else f"{repo}: cloned on connect"
-        rows = [html.Button(name + "/", id=dict(entry=name)) for name, is_folder in entries if is_folder]
-        return folder, rows or [html.Span("no folders", className="path")], folder, repo, label
-
     def experiment_running() -> bool:
         return run["process"] is not None and run["process"].poll() is None
 
@@ -839,46 +512,76 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         run.update(exp_dir=folder, t0=buffer[-1]["time"] if buffer else None, held="")
         threading.Thread(target=hold, args=(token, folder), daemon=True).start()
 
-    def open_session(name: str) -> str:
-        """Open a session (a configured controller's: its tunnel, then its controller); why not, if it cannot."""
-        config = next((c for c in saved_controllers() if c["name"] == name), None)
-        found = known_hosts().get(config["host"]) if config else None
-        if config is None or found is None:
-            return f"{name}: its ssh host is no longer in {SSH_CONFIG}, configure it again"
-        save_controller(config["name"], config["host"], config["repo"])  # last used first
+    def open_session(wifi: str | None = None, password: str | None = None):
+        """Open the session: the tunnel to the Pi over the route that answers (or this computer's mock), then its
+        controller. An address and password given are saved as this computer's."""
+        if wifi is not None:
+            raspberrypi.save_settings(wifi.strip() or raspberrypi.ROUTES["wifi"], password or "")
         buffer.clear()
         trajectory.clear()
-        opened = Tunnel(found["hostname"], found["user"], found["port"], found["password"],
-                        (streams.SAMPLE_PORT, streams.PROFILE_PORT), tuple(found["keys"]))
-        state.update(session=dict(name=name), tunnel=opened, repo=config["repo"], autostart=True)
-        return ""
+        settings = raspberrypi.load_settings()
+        opened = raspberrypi.Local() if mock else raspberrypi.Tunnel(raspberrypi.ROUTES | dict(wifi=settings["wifi"]), settings["password"],
+                                                   (streams.SAMPLE_PORT, streams.PROFILE_PORT))
+        state.update(session=dict(name="mock" if mock else "pi"), tunnel=opened, autostart=True, hotspot=None)
 
     def close_session():
         if state["tunnel"] is not None:
             state["tunnel"].close()  # ctrl-c to the controller first
-        state.update(session=None, tunnel=None, repo=None, autostart=False)
+        state.update(session=None, tunnel=None, autostart=False, hotspot=None)
+
+    def start_controller():
+        """Run the controller script, on the Pi from this computer's copy of the code."""
+        tunnel = state["tunnel"]
+        if not mock:
+            try:
+                state["hotspot"] = tunnel.hotspot_on()
+            except Exception:  # no switch offered
+                state["hotspot"] = None
+        return tunnel.start(script)
 
     @app.callback(
         Output("landing", "style"), Output("session", "style"), Output("disconnect", "style"),
-        Output("session-pill", "style"), Output("experiment-pill", "style"), Output("landing-note", "children"),
+        Output("session-pill", "style"), Output("experiment-pill", "style"),
         Output("status", "style"), Output("live-section", "style"), Output("disconnect", "children"),
         Input("connect", "n_clicks"), Input("review-only", "n_clicks"), Input("disconnect", "n_clicks"),
-        Input("fast", "n_intervals"), State("controller-pick", "value"),
+        Input("fast", "n_intervals"), State("pi-wifi", "value"), State("pi-password", "value"),
     )
-    def session(_connect, _review, _disconnect, _, picked):
+    def session(_connect, _review, _disconnect, _, wifi, password):
         """The landing page, or the session (a reloaded page returns to the open one)."""
-        note = no_update if ctx.triggered_id == "fast" else ""
         if ctx.triggered_id == "connect" and state["session"] is None:
-            note = open_session(picked) if picked not in (None, NEW) else "configure a controller first"
+            open_session(wifi or "", password)
         elif ctx.triggered_id == "review-only" and state["session"] is None:
             state.update(session=dict(name=None))
         elif ctx.triggered_id == "disconnect" and not busy():
             close_session()
         if state["session"] is None:
-            return dict(), hide, hide, hide, hide, note, no_update, no_update, no_update
+            return dict(), hide, hide, hide, hide, no_update, no_update, no_update
         if state["session"]["name"] is None:  # review only: no controller, no live view
-            return hide, dict(), dict(), hide, hide, note, hide, hide, "Back"
-        return hide, dict(), dict(), dict(), dict(), note, dict(), dict(), "Disconnect"
+            return hide, dict(), dict(), hide, hide, hide, hide, "Back"
+        return hide, dict(), dict(), dict(), dict(), dict(), dict(), "Disconnect"
+
+    @app.callback(
+        Output("wifi-switch-label", "children"), Output("wifi-switch-label", "style"),
+        Output("wifi-switch-label", "disabled"), Output("wifi-switch", "message"),
+        Input("wifi-switch", "submit_n_clicks"), Input("slow", "n_intervals"),
+    )
+    def wifi_switch(_submit, _):
+        """Move the Pi's wifi between the lab's and its own network, once the session knows which it is on."""
+        tunnel, hotspot = state["tunnel"], state["hotspot"]
+        if mock or tunnel is None or hotspot is None or not (tunnel.connected and tunnel.alive()):
+            return no_update, hide, no_update, no_update
+        if ctx.triggered_id == "wifi-switch" and not busy():
+            try:
+                tunnel.switch_wifi(not hotspot)
+                hotspot = state["hotspot"] = not hotspot
+            except Exception as error:
+                print(f"wifi switch failed: {error}")
+        dropped = "" if tunnel.route == "usb" else (" This connection drops: join the other network on this computer, "
+                                                    "then Reconnect.")
+        if hotspot:
+            return "Pi wifi: exo-pi", dict(), busy(), ("Turn the Pi's own wifi exo-pi off, so it joins the lab wifi "
+                                                       "(exo-pi comes back if it can't within 30 s)?" + dropped)
+        return "Pi wifi: lab", dict(), busy(), "Switch the Pi to its own wifi network exo-pi?" + dropped
 
     def named_folder(name: str) -> str:
         """An existing experiment folder of that name, else today's new one."""
@@ -957,47 +660,17 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         fits = "" if power_assist == experiment.load_settings(folder).power_assist else ", kept out of the optimization"
         return f"{repeated}saved as trial {index}{fits}", trial_style, options
 
-    @app.callback(
-        Output("force-pull-confirm", "displayed"), Output("force-pull-confirm", "message"),
-        Input("slow", "n_intervals"), prevent_initial_call=True,
-    )
-    def force_pull_prompt(_):
-        """Ask once per refused pull whether to force pull the host's checkout."""
-        tunnel = cast(Tunnel | None, state["tunnel"])
-        command = tunnel.command if tunnel is not None else None
-        if command is None or command.exit_status() != PULL_REFUSED or state.get("pull_asked") is command:
-            return no_update, no_update
-        state["pull_asked"] = command
-        reason = (command.output.strip().split("\n") or [""])[-1]
-        return True, (f"{state['session']['name']}'s checkout {state['repo']} can't fast-forward to this computer's"
-                      f"{f' ({reason})' if reason else ''}.\n\nForce update, resetting it to this computer's? "
-                      f"{FORCE_PULL_NOTE}"
-                      "\nCancel runs the checkout as it is.")
-
-    @app.callback(
-        Output("force-pull-confirm", "displayed", allow_duplicate=True),
-        Input("force-pull-confirm", "submit_n_clicks"), Input("force-pull-confirm", "cancel_n_clicks"),
-        prevent_initial_call=True,
-    )
-    def force_pull_answer(_submit, _cancel):
-        tunnel = cast(Tunnel | None, state["tunnel"])
-        if tunnel is None or not (tunnel.connected and tunnel.alive()):
-            return False
-        pull = "force" if ctx.triggered[0]["prop_id"].endswith("submit_n_clicks") else "skip"
-        with start_lock:
-            tunnel.start(controller_command(state["repo"], state.get("bundle"), remote, script, pull))
-        return False
-
     def session_status(last: dict | None, current: dict | None, history: list[experiment.Trial], segment: dict,
                        window: dict, settings: experiment.Settings) -> Status:
         """Where the session is, from the tunnel, the controller, its stream and the experiment."""
-        tunnel = cast(Tunnel, state["tunnel"])
-        name = state["session"]["name"]
+        tunnel = state["tunnel"]
+        name = "the Pi" if state["session"]["name"] == "pi" else "the mock"
         command = tunnel.command if tunnel.alive() else None
         if not tunnel.alive():
             return Status(0, "error", f"Can't reach {name}", tunnel.error or "The ssh connection dropped.", "reconnect")
         if not tunnel.connected:
-            return Status(0, "busy", f"Connecting to {name}…", tunnel.target)
+            return Status(0, "busy", f"Connecting to {name}…",
+                          tunnel.target if tunnel.route else "Trying the lab wifi, its own wifi exo-pi and the USB-C cable.")
         if last is None:
             if command is not None and command.running():
                 if received["at"] > -math.inf:
@@ -1067,14 +740,13 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         choice, held_trial, label = args[-4 - fields:-1 - fields]
         if state["session"] is None or state["session"]["name"] is None:
             return (no_update,) * 21
-        tunnel, trigger = cast(Tunnel, state["tunnel"]), ctx.triggered_id
+        tunnel, trigger = state["tunnel"], ctx.triggered_id
 
         # clicks: reconnect, the controller, the experiment
         if trigger == "reconnect" and not busy():
-            controller_name = state["session"]["name"]
             close_session()
-            open_session(controller_name)
-            tunnel = cast(Tunnel, state["tunnel"])
+            open_session()
+            tunnel = state["tunnel"]
         connected = tunnel.connected and tunnel.alive()
         # ticks run concurrently: without the lock two of them autostart two controllers (racing clones)
         with start_lock:
@@ -1083,9 +755,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             if (trigger == "controller-start" or (state["autostart"] and command is None)) and connected:
                 if running:
                     command.interrupt()
-                state["bundle"], failed = send_commits(tunnel, state["repo"])
-                command = tunnel.start(controller_command(state["repo"], state["bundle"], remote, script,
-                                                          warning=failed))
+                command = start_controller()
                 running, state["autostart"] = True, False
         if trigger == "controller-stop" and running:
             command.interrupt()
@@ -1101,7 +771,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             stream_path["path"] = None
         elif trigger == "optimize" and run["opened"] and not busy():
             options = experiment.load_settings(run["exp_dir"])._asdict()
-            run.update(process=launch_optimization(run["exp_dir"], host, options), started=time.monotonic(),
+            run.update(process=launch_optimization(run["exp_dir"], options), started=time.monotonic(),
                        t0=buffer[-1]["time"] if buffer else None, held=None)
         elif trigger == "held-start" and run["opened"] and not busy():
             folder, _, problem = held_mode(choice, held_trial)
@@ -1139,7 +809,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         if command is not None and not running:
             exit_status = command.exit_status()
             log += "\n· controller exited" + (f" ({exit_status})" if exit_status not in (None, -1) else "")
-        summary = f"Controller terminal · live · {'running' if running else 'stopped'} · {posixpath.join(state['repo'], script)}"
+        summary = f"Controller terminal · live · {'running' if running else 'stopped'} · {script}"
 
         dot = {"error": "error", "busy": "busy"}.get(now.tone, "ok") if now.step or now.tone != "busy" else "busy"
         pill = [html.Span(className=f"dot {dot}"), html.B(state["session"]["name"]), tunnel.target]
@@ -1239,27 +909,14 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("exp_dir", nargs="?", default="experiments/mock", help="experiment folder")
-    parser.add_argument("--host", default="localhost", help="controller host (tunnel endpoint)")
     parser.add_argument("--port", type=int, default=8050, help="dashboard port")
-    parser.add_argument("--exo-host", default="", help="manual new host's default address")
-    parser.add_argument("--exo-user", default="pi", help="ssh user on the Pi")
-    parser.add_argument("--exo-port", type=int, default=22, help="ssh port on the Pi")
     parser.add_argument("--atoms", type=int, default=experiment.DEFAULT.atoms, help="new experiment default (as bo-loop)")
-    parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)  # simulated legs on the host
+    parser.add_argument("--mock", action="store_true", help="simulated legs on this computer instead of the Pi")
     parser.add_argument("--diagnose", action="store_true", help="run the drive check instead of the controller")
     args = parser.parse_args()
 
-    remote, updated, warning = update_checkout()
-    # new commits: start over on them, with their dependencies
-    if updated:
-        try:
-            sys.exit(subprocess.call(["uv", "run", "--project", str(REPO), "--group", "optimizer", "start", *sys.argv[1:]]))
-        except OSError as error:
-            warning = f"pulled new commits but could not restart on them ({error}): restart the dashboard"
-    if warning:
-        print(warning)
-    run_dashboard(args.exp_dir, args.host, args.port, (args.exo_host, args.exo_user, args.exo_port), args.atoms,
-                  DIAGNOSE if args.diagnose else MOCK_CONTROLLER if args.mock else CONTROLLER, remote, warning)
+    run_dashboard(args.exp_dir, args.port, args.atoms,
+                  DIAGNOSE if args.diagnose else MOCK if args.mock else CONTROLLER)
 
 
 if __name__ == "__main__":

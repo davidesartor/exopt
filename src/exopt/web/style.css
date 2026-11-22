@@ -62,7 +62,6 @@ h2 { font-size: 13px; font-weight: 650; text-transform: uppercase; letter-spacin
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr)); gap: 10px; margin-bottom: 10px; }
 .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .controls span { color: var(--ink-2); font-size: 13px; }
-.controls span.path { font: 12px ui-monospace, Menlo, monospace; }
 
 button, input { font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--axis);
   background: var(--surface); color: var(--ink); }
@@ -105,11 +104,6 @@ button.danger { color: var(--err); border-color: var(--err); background: var(--s
 .form { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 18px; }
 .field label { display: block; font-size: 12px; font-weight: 600; color: var(--ink-2); margin-bottom: 5px; }
 .field .help { font-size: 12px; color: var(--muted); margin-top: 4px; }
-.browser { max-height: 15em; overflow-y: auto; border: 1px solid var(--axis); border-radius: 8px; margin-bottom: 8px; }
-.browser button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: none;
-  font: 12px ui-monospace, Menlo, monospace; padding: 4px 10px; }
-.browser button:hover { background: var(--page); }
-.browser button.picked { color: var(--accent); font-weight: 600; }
 .dash-input, .dash-input-element { background: var(--surface) !important; color: var(--ink) !important; font-size: 13px !important; }
 .dash-options-list-option { color: var(--ink) !important; font-size: 13px; }
 .dash-dropdown, .dash-dropdown-content, .dash-dropdown-search { background: var(--surface) !important;
