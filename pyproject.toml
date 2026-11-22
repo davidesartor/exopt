@@ -33,4 +33,4 @@ optimizer = [
 ]
 
 [tool.uv.sources]
-bofus = { git = "https://github.com/davidesartor/BOFUS", rev = "adapt_rho" }
+bofus = { git = "https://github.com/davidesartor/BOFUS", rev = "abf6e1cf898cf80a6974c83a6714432ce4df2850" }

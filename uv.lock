@@ -100,7 +100,7 @@ wheels = [
 [[package]]
 name = "bofus"
 version = "0.1.0"
-source = { git = "https://github.com/davidesartor/BOFUS?rev=adapt_rho#53b0e03df194b2a6a0ad377099ba9675fb8a89a1" }
+source = { git = "https://github.com/davidesartor/BOFUS?rev=abf6e1cf898cf80a6974c83a6714432ce4df2850#abf6e1cf898cf80a6974c83a6714432ce4df2850" }
 dependencies = [
     { name = "equinox" },
     { name = "jax" },
@@ -499,7 +499,7 @@ optimizer = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bofus", git = "https://github.com/davidesartor/BOFUS?rev=adapt_rho" },
+    { name = "bofus", git = "https://github.com/davidesartor/BOFUS?rev=abf6e1cf898cf80a6974c83a6714432ce4df2850" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "jax", specifier = ">=0.10.2" },
     { name = "jaxtyping", specifier = ">=0.3.11" },

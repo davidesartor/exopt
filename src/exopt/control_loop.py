@@ -6,7 +6,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from bofus.rkhs import X_MAX, RBFMixture
+from bofus.rkhs import RBFMixture
 from einops import rearrange
 from jaxtyping import Float
 
@@ -15,6 +15,8 @@ from exopt.gait_estimation import PhaseEstimator
 from exopt.drives_md80 import MAX_TORQUE, Drives
 
 PERIODIC = (True,)  # a profile's one input, the gait phase, wraps
+X_MAX = 1.0  # the profile domain [-X_MAX, X_MAX) spans one gait cycle
+X_RANGE = (-X_MAX, X_MAX)
 SAMPLING_STEP = 0.01  # [s] control loop period
 STILL_SPEED = 0.15  # [rad/s] both legs slower than this count as standing still (velocity noise sd 0.03)
 STILL_TIME = 1.0  # [s] standing still before the logged positions are re-zeroed on the standing pose
@@ -52,7 +54,7 @@ def profile_torque(
     """Torque [Nm] of a profile at gait phases [rad]: MAX_TORQUE * tanh(base + mixture).
 
     The base is the power assist sinusoid of peak `power_assist` before the tanh, so a zero mixture applies it exactly."""
-    values = jax.vmap(lambda x: profile(x, PERIODIC))(rearrange(unit_phase(phase), "p -> p 1"))
+    values = jax.vmap(lambda x: profile(x, X_RANGE, PERIODIC))(rearrange(unit_phase(phase), "p -> p 1"))
     # a peak at MAX_TORQUE puts the base at ±inf, where the tanh saturates exactly
     with np.errstate(divide="ignore"):
         base = np.arctanh(power_assist_torque(power_assist, phase) / MAX_TORQUE)

@@ -7,11 +7,11 @@ import math
 import jax
 import numpy as np
 import plotly.graph_objects as go
-from bofus.rkhs import X_MAX, RBFMixture
+from bofus.rkhs import RBFMixture
 from einops import rearrange
 
 from exopt import experiment
-from exopt.control_loop import MAX_TORQUE, PERIODIC, power_assist_torque, profile_torque, unit_phase
+from exopt.control_loop import MAX_TORQUE, PERIODIC, X_MAX, X_RANGE, power_assist_torque, profile_torque, unit_phase
 
 LIVE_WINDOW = 10.0  # [s] of leg traces in the running view
 LIVE_STRIDE = 3  # plot every 3rd sample of the traces, so a refresh stays cheap
@@ -163,7 +163,7 @@ def profile_figure(
         # each atom's term in Nm before the tanh soft clip: they sum to the profile only where it is far from saturating
         atoms = jax.tree.map(lambda z: rearrange(z, "m ... -> m 1 ..."), profile)
         points = rearrange(unit_phase(PHASE), "p -> p 1")
-        atom_torques = MAX_TORQUE * np.asarray(jax.vmap(lambda x: atoms(x, PERIODIC))(points)).T
+        atom_torques = MAX_TORQUE * np.asarray(jax.vmap(lambda x: atoms(x, X_RANGE, PERIODIC))(points)).T
         centers = (np.asarray(profile.x[:, 0]) / X_MAX + 1) / 2
         lengthscales = np.sqrt(np.asarray(profile.l[:, 0])) / (2 * X_MAX)
         for k, (atom_torque, c, ls, a) in enumerate(zip(atom_torques, centers, lengthscales, np.asarray(profile.a))):

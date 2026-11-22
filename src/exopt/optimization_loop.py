@@ -20,23 +20,24 @@ import zmq
 from einops import rearrange
 from bofus import acquisition
 from bofus.gp import GaussianProcess
-from bofus.rkhs import X_MAX, RBFMixture, distance
+from bofus.rkhs import LRange, RBFMixture, distance
 
 from exopt import experiment, streams
-from exopt.control_loop import MAX_TORQUE, PERIODIC
+from exopt.control_loop import MAX_TORQUE, PERIODIC, X_MAX, X_RANGE
 from exopt.review import write_review
 
 MAX_CAPACITY = 1024  # largest history capacity compiled ahead
+A_MAX = 3.0  # atom amplitude box [-A_MAX, A_MAX], wide enough for the tanh to saturate
 # torque in phase with the velocity: opposite atoms at the two velocity peaks, 1 rad wide (a sinusoid to 2 %)
 POWER_ASSIST = RBFMixture(jnp.full((2, 1), (X_MAX / jnp.pi) ** 2), jnp.array([[0.5], [-0.5]]) * X_MAX,
-                          jnp.array([1.0, -1.0]) * acquisition.A_MAX)
+                          jnp.array([1.0, -1.0]) * A_MAX)
 SEED_INTENSITIES = (0.0, 0.25, 0.5, 0.75, 1.0)  # of the power assist, measured before optimizing
 
 
-def variance_range(settings: experiment.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
-    """Atom variances l (domain [-X_MAX, X_MAX] for the cycle) of the settings' lengthscales in rad of gait phase."""
-    to_variance = lambda lengthscale: jnp.asarray((lengthscale * X_MAX / jnp.pi) ** 2)
-    return to_variance(settings.min_lengthscale), to_variance(settings.max_lengthscale)
+def variance_range(settings: experiment.Settings) -> LRange:
+    """Atom variances on the profile domain for the settings' lengthscale range (rad of gait phase)."""
+    return tuple((lengthscale * X_MAX / np.pi) ** 2 for lengthscale in (settings.min_lengthscale,
+                                                                        settings.max_lengthscale))
 
 
 def scaled(profile: RBFMixture, intensity: float) -> RBFMixture:
@@ -47,7 +48,7 @@ def scaled(profile: RBFMixture, intensity: float) -> RBFMixture:
 def missing_seeds(history: list[experiment.Trial]) -> list[RBFMixture]:
     """The power assist intensities no trial has measured yet (held runs count)."""
     seeds = [scaled(POWER_ASSIST, intensity) for intensity in SEED_INTENSITIES]
-    measured = lambda seed: any(distance(seed, t.profile, periodic=PERIODIC) < 1e-2 for t in history)
+    measured = lambda seed: any(distance(seed, t.profile, None, X_RANGE, PERIODIC) < 1e-2 for t in history)
     return [seed for seed in seeds if not measured(seed)]
 
 
@@ -57,12 +58,15 @@ def capacity(trials_count: int) -> int:
 
 
 def stack(
-    profiles: list[RBFMixture], losses: list[float], ses: list[float]
+    key: Key, profiles: list[RBFMixture], losses: list[float], ses: list[float], l_range: LRange
 ) -> tuple[RBFMixture, Float[Array, "n"], Float[Array, "n"]]:
-    """One batched history, nan-padded to a power-of-2 length so proposals recompile only when it doubles."""
+    """One batched history, nan-padded to a power-of-2 length so proposals recompile only when it doubles.
+
+    Profiles with fewer atoms get prior atoms of zero amplitude, which the acquisition can grow."""
     m = max(p.a.shape[-1] for p in profiles)
     n = capacity(len(profiles))
-    padded = [p.pad_to(m) for p in profiles]
+    padded = [p if p.a.shape[-1] == m else p.pad_to(jr.fold_in(key, i), m, l_range, X_RANGE)
+              for i, p in enumerate(profiles)]
     padded += [padded[0]] * (n - len(padded))
     ys = jnp.full(n, jnp.nan).at[: len(losses)].set(jnp.array(losses))
     # an undefined SE counts as noiseless, the fitted nugget still applies
@@ -85,21 +89,22 @@ def propose_next(
     history: RBFMixture,
     ys: Float[Array, "n"],
     y_stds: Float[Array, "n"],
-    l_range: tuple[Float[Array, ""], Float[Array, ""]],
+    l_range: LRange,
     atoms: int = 2,
     raw_samples: int = 1024,
     max_restarts: int = 32,
 ) -> tuple[RBFMixture, dict[str, Float[Array, ""]]]:
     """Maximize log-EI over profiles of at least `atoms` atoms; also the posterior summary the stop rule reads."""
-    key_fit, key_acquisition = jr.split(key)
+    key_pad, key_fit, key_acquisition = jr.split(key, 3)
 
     # one output per profile, padded so candidates get `atoms` atoms
-    history = history.pad_to(max(atoms, history.a.shape[-1]))
+    if history.a.shape[-1] < atoms:
+        history = history.pad_to(key_pad, atoms, l_range, X_RANGE)
     f = jax.tree.map(lambda z: rearrange(z, "n ... -> n 1 ..."), history)
-    surrogate = GaussianProcess.fit(key_fit, f, ys, y_std=y_stds, periodic=PERIODIC)
+    surrogate = GaussianProcess.fit(key_fit, f, ys, y_std=y_stds, x_range=X_RANGE, periodic=PERIODIC)
 
     candidate = acquisition.optimize_expected_improvement(
-        key_acquisition, surrogate, l_range, multi_starts=max_restarts, n_probes=raw_samples
+        key_acquisition, surrogate, l_range, (-A_MAX, A_MAX), multi_starts=max_restarts, n_probes=raw_samples
     )
     return jax.tree.map(lambda z: z[0, 0], candidate), best_posterior(surrogate)
 
@@ -108,7 +113,7 @@ def propose_next(
 def posterior_means(key: Key, history: RBFMixture, ys: Float[Array, "n"], y_stds: Float[Array, "n"]) -> Float[Array, "n"]:
     """Posterior mean loss at each profile of the history, infinite at the padding."""
     f = jax.tree.map(lambda z: rearrange(z, "n ... -> n 1 ..."), history)
-    surrogate = GaussianProcess.fit(key, f, ys, y_std=y_stds, periodic=PERIODIC)
+    surrogate = GaussianProcess.fit(key, f, ys, y_std=y_stds, x_range=X_RANGE, periodic=PERIODIC)
     mean, _ = surrogate.predict_marginal(surrogate.f)
     return jnp.where(jnp.isfinite(ys), jnp.ravel(mean), jnp.inf)
 
@@ -120,8 +125,10 @@ def fitted(history: list[experiment.Trial], settings: experiment.Settings) -> li
 
 def best_trial(history: list[experiment.Trial], settings: experiment.Settings) -> experiment.Trial:
     """The trial whose profile has the lowest posterior mean loss."""
-    stacked = stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history])
-    return history[int(posterior_means(jr.key(settings.seed), *stacked).argmin())]
+    key = jr.key(settings.seed)
+    stacked = stack(key, [t.profile for t in history], [t.loss for t in history], [t.se for t in history],
+                    variance_range(settings))
+    return history[int(posterior_means(key, *stacked).argmin())]
 
 
 HELD_CHOICES = {"off": "exo off (zero torque)", "assist": "power assist (full intensity)",
@@ -145,10 +152,11 @@ def held_profile(exp_dir: str, choice: str, trial: int | None = None) -> tuple[R
 def compile_ahead(history: list[experiment.Trial], settings: experiment.Settings) -> None:
     """Compile the proposal for each coming history capacity, so none stalls the session; jit reuses them."""
     profiles = [t.profile for t in history] or [POWER_ASSIST]
+    l_range = variance_range(settings)
     size = capacity(max(len(history) + 1, len(SEED_INTENSITIES)))
     while size <= MAX_CAPACITY:
         propose_next.lower(
-            jr.key(0), *stack((profiles * size)[:size], [0.0] * size, [0.0] * size), variance_range(settings),
+            jr.key(0), *stack(jr.key(0), (profiles * size)[:size], [0.0] * size, [0.0] * size, l_range), l_range,
             atoms=settings.atoms, raw_samples=settings.raw_samples, max_restarts=settings.max_restarts,
         ).compile()
         size *= 2
@@ -159,10 +167,13 @@ def next_profile(key: Key, history: list[experiment.Trial], settings: experiment
     if seeds := missing_seeds(history):
         return seeds[0], None
 
+    key_pad, key_proposal = jr.split(jr.fold_in(key, len(history)))
+    l_range = variance_range(settings)
     candidate, best = propose_next(
-        jr.fold_in(key, len(history)),
-        *stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history]),
-        variance_range(settings),
+        key_proposal,
+        *stack(key_pad, [t.profile for t in history], [t.loss for t in history], [t.se for t in history],
+               l_range),
+        l_range,
         atoms=settings.atoms,
         raw_samples=settings.raw_samples,
         max_restarts=settings.max_restarts,
