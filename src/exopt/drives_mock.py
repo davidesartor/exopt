@@ -1,4 +1,4 @@
-"""Mock controller script: controller.py on simulated legs fitted to the 2026-11-06 sessions, through a stand-in pyCandle."""
+"""Mock drives script: control_loop.py on simulated legs fitted to the 2026-11-06 sessions, through a stand-in pyCandle."""
 
 import argparse
 import runpy
@@ -12,7 +12,7 @@ from typing import NamedTuple
 import numpy as np
 from jaxtyping import Float
 
-from exopt.controller import MAX_TORQUE, SAMPLING_STEP
+from exopt.control_loop import MAX_TORQUE, SAMPLING_STEP
 
 # per-leg hip angle over a stride [rad]: mean, then (cos, sin) of harmonics 1-4
 # fitted on 2026-11-06-atoms4 trials 4-19; leg 1's encoder is mirrored, so both fundamentals align
@@ -215,4 +215,4 @@ if __name__ == "__main__":
                         help="the first command over 11 Nm stalls the reads, then the drives only brake")
     args = parser.parse_args()
     sys.modules["pyCandle"] = simulated_pycandle(args.seed, args.drive_fault)
-    runpy.run_path(str(Path(__file__).with_name("controller.py")), run_name="__main__")
+    runpy.run_path(str(Path(__file__).with_name("control_loop.py")), run_name="__main__")

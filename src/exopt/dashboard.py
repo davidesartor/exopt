@@ -22,7 +22,7 @@ import numpy as np
 import paramiko
 import plotly.graph_objects as go
 
-from exopt import link, metabolic, trials
+from exopt import experiment, metabolic, streams
 from exopt.figures import (CLICKABLE, LIGHT, LIVE_HEIGHT, LIVE_ROWS, LIVE_STRIDE, LIVE_WINDOW, PAGE_CSS, THEMES, TRIAL, WEB, Palette,
                            break_wraps, cycles, estimate_figure, experiment_figure, gait_period, live_figure,
                            load_trials, loss_figure, placeholder, portrait_figure, power_figure, profile_figure,
@@ -30,12 +30,12 @@ from exopt.figures import (CLICKABLE, LIGHT, LIVE_HEIGHT, LIVE_ROWS, LIVE_STRIDE
 from exopt.tunnel import (SSH_CONFIG, Tunnel, delete_controller, known_hosts, save_controller, save_host,
                           saved_controllers)
 
-columns = trials.columns
+columns = experiment.columns
 BUFFER_SECONDS = 60.0  # [s] of samples kept at full rate
 TORQUE_WINDOW = 4.0  # [s] of live torque overlaid on the applied profile
 NEW = "::new"  # the controller picker's configure new entry
 REPO = Path(__file__).resolve().parents[2]
-CONTROLLER, MOCK_CONTROLLER, DIAGNOSE = "src/exopt/controller.py", "src/exopt/mock_controller.py", "src/exopt/diagnose.py"
+CONTROLLER, MOCK_CONTROLLER, DIAGNOSE = "src/exopt/control_loop.py", "src/exopt/drives_mock.py", "src/exopt/diagnose.py"
 REFRESH_MS = 1000  # live band refresh period (1 Hz)
 FEED_MS = 1000 / 60  # live traces and segment estimate pulled and drawn at 60 Hz
 FEED_POINTS = int((LIVE_WINDOW + 1.0) / 0.01 / LIVE_STRIDE)  # kept per trace by the page
@@ -86,8 +86,8 @@ class Status(NamedTuple):
     progress: tuple[int, int, int, str] | None = None  # valid gaits, min, max, stop reason
 
 
-def trial_status(last: dict, current: dict | None, history: list[trials.Trial], segment: dict,
-                 settings: trials.Settings) -> Status:
+def trial_status(last: dict, current: dict | None, history: list[experiment.Trial], segment: dict,
+                 settings: experiment.Settings) -> Status:
     """The experiment's status: starting, ramping, measuring a trial, or choosing the next profile."""
     if last["stage"] != "running":
         return Status(2, "action", "Walking stopped", "The torque is off. Start walking again to resume.", "stop",
@@ -104,14 +104,14 @@ def trial_status(last: dict, current: dict | None, history: list[trials.Trial], 
     if last["profile_id"] != current["id"] or last["gain"] < 1 or len(segment.get("time", [])) < 2:
         return Status(2, "busy", "Ramping up the torque", "Keep walking. Measuring starts at full torque.", "stop",
                       eyebrow)
-    loss, se, gaits = trials.gait_estimate(segment, settings)
-    reason = trials.stop_reason(loss, se, gaits, rule, settings) or ""
+    loss, se, gaits = experiment.gait_estimate(segment, settings)
+    reason = experiment.stop_reason(loss, se, gaits, rule, settings) or ""
     detail = f"Stopping at the end of this gait: {STOP_WORDS[reason]}." if reason else "Keep walking."
     return Status(2, "ok", f"Measuring trial {index}", detail, "stop", eyebrow,
                   (gaits, settings.min_gaits, settings.max_gaits, reason))
 
 
-def live_tiles(s: dict, last: dict | None, segment: dict, history: list[trials.Trial], settings: trials.Settings
+def live_tiles(s: dict, last: dict | None, segment: dict, history: list[experiment.Trial], settings: experiment.Settings
                ) -> list[tuple]:
     """(label, value, detail) for each tile."""
     period = gait_period(s) if s else None
@@ -121,9 +121,9 @@ def live_tiles(s: dict, last: dict | None, segment: dict, history: list[trials.T
         ("torque", f"{100 * gain:.0f}%", "full" if gain >= 1 else "ramping" if gain > 0 else "off") if last
         else ("torque", "—", "no data"),
     ]
-    _, _, gaits = trials.gait_estimate(segment, settings) if len(segment.get("time", [])) > 1 else (0, 0, 0)
+    _, _, gaits = experiment.gait_estimate(segment, settings) if len(segment.get("time", [])) > 1 else (0, 0, 0)
     if gaits >= 2:
-        loss, se, _ = trials.gait_estimate(segment, settings)
+        loss, se, _ = experiment.gait_estimate(segment, settings)
         tiles.append(("this trial", f"{loss:.3f}", f"± {se:.3f} · {gaits} valid gaits"))
     else:
         tiles.append(("this trial", "—", "waiting for 2 valid gaits"))
@@ -153,11 +153,11 @@ def metabolic_status(last: dict, payload: dict | None, elapsed: float) -> Status
                   eyebrow)
 
 
-def launch_bo_loop(exp_dir: str, host: str, options: dict) -> subprocess.Popen:
+def launch_optimization(exp_dir: str, host: str, options: dict) -> subprocess.Popen:
     """Start a bo-loop session in the background, logging to <exp_dir>/data/bo-loop.log."""
     os.makedirs(os.path.join(exp_dir, "data"), exist_ok=True)
     flags = [arg for name, value in options.items() for arg in (f"--{name.replace('_', '-')}", str(value))]
-    command = [sys.executable, "-u", "-m", "exopt.bo_loop", "--exp-dir", exp_dir, "--host", host, *flags]
+    command = [sys.executable, "-u", "-m", "exopt.optimization_loop", "--exp-dir", exp_dir, "--host", host, *flags]
     with open(os.path.join(exp_dir, "data", "bo-loop.log"), "a") as log:
         # its own process group on Windows, so a ctrl-break reaches it alone
         group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else {}
@@ -265,14 +265,14 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
     # drain the controller's sample stream from a background thread: a rolling buffer, and a thinned whole record
-    stream, profiles = link.driver_link(host)
+    stream, profiles = streams.driver_link(host)
     buffer: deque[dict] = deque(maxlen=int(BUFFER_SECONDS / 0.01))
     trajectory: deque[tuple] = deque(maxlen=int(4 * 3600 / 0.01 / TRAJECTORY_STRIDE))
     received = dict(at=-math.inf)
     # the metabolic test held now, if any: tagged in the experiment's stream
     recording: dict = dict(token=None, payload=None, started=None)
     # every sample while an experiment is open, stamped with this computer's clock, to its stream file
-    stream_log, stream_path = trials.StreamLog(), dict(path=None)
+    stream_log, stream_path = experiment.StreamLog(), dict(path=None)
 
     def pump():
         count = 0
@@ -312,10 +312,10 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
     field = lambda label, control, help="": html.Div(className="field", children=[
         html.Label(label), control, html.Div(help, className="help") if help else None])
     number = lambda id, value, width, **kw: dcc.Input(id=id, type="number", value=value, style=dict(width=width), **kw)
-    defaults = trials.DEFAULT._replace(atoms=atoms)
+    defaults = experiment.DEFAULT._replace(atoms=atoms)
 
     def setting_field(name: str):
-        label, hint = trials.SETTINGS_HELP[name]
+        label, hint = experiment.SETTINGS_HELP[name]
         default = getattr(defaults, name)
         step = 1 if isinstance(default, int) else "any"
         return field(label, number(f"exp-{name}", default, "100%", min=0, step=step), hint or "")
@@ -391,7 +391,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             ]),
             html.Details(className="advanced", children=[
                 html.Summary("Advanced"),
-                html.Div(className="form", children=[setting_field(name) for name in trials.Settings._fields
+                html.Div(className="form", children=[setting_field(name) for name in experiment.Settings._fields
                                                      if name not in BASIC_SETTINGS]),
             ]),
             html.Div(className="controls", style=dict(marginTop="20px"), children=[
@@ -547,7 +547,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         if not (state["session"] or {}).get("name"):
             return {id: dict(key="none", figure=as_dict(placeholder(p, "no controller", title)))
                     for id, title in titles.items() if shown.get(id) != "none"}
-        current = trials.load_current(run["exp_dir"])
+        current = experiment.load_current(run["exp_dir"])
         current_id = current and current["id"]
         latest = data[-1]["time"] if data else None
         figures = {}
@@ -561,7 +561,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             else:
                 if (current_id, theme) not in profile_bases:
                     empty = {f"{kind}_{leg}": np.zeros(0) for kind in ("phase", "torque") for leg in (0, 1)}
-                    profile = trials.decode_profile(current) if current else None
+                    profile = experiment.decode_profile(current) if current else None
                     profile_bases.clear()
                     profile_bases[current_id, theme] = as_dict(
                         profile_figure(titles["now-profile"], profile, empty, "torque",
@@ -577,7 +577,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             figures["now-profile"] = dict(key=key, figure=figure)
 
         # samples of the profile being collected, once at full gain, after the warmup
-        settings = trials.load_settings(run["exp_dir"])
+        settings = experiment.load_settings(run["exp_dir"])
         segment = [x for x in data if current and x["profile_id"] == current_id and x["gain"] >= 1][settings.warmup:]
         key = f"{current_id}:{len(segment)}"
         if shown.get("segment") != key:
@@ -802,11 +802,11 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         while recording["token"] is token:
             profiles.send_json(recording["payload"] or dict(id=None))
             time.sleep(1.0)
-        link.release(profiles)
+        streams.release(profiles)
         stream_log.event(path, dict(metabolic="stop", stopped_at=datetime.now().astimezone().isoformat()))
 
     def start_recording(folder: str, condition: str, payload: dict | None, label: str):
-        trials.save_current(folder, payload)
+        experiment.save_current(folder, payload)
         token = object()
         recording.update(token=token, payload=payload, started=time.monotonic())
         stream_log.event(stream_path["path"], dict(
@@ -826,7 +826,7 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         buffer.clear()
         trajectory.clear()
         opened = Tunnel(found["hostname"], found["user"], found["port"], found["password"],
-                        (link.SAMPLE_PORT, link.PROFILE_PORT), tuple(found["keys"]))
+                        (streams.SAMPLE_PORT, streams.PROFILE_PORT), tuple(found["keys"]))
         state.update(session=dict(name=name), tunnel=opened, repo=config["repo"], autostart=True)
         return ""
 
@@ -880,13 +880,13 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             return no_update, "give the experiment a name", no_update
         return hide, "", no_update
 
-    @app.callback(Output("exp-folder", "children"), *(Output(f"exp-{name}", "value") for name in trials.Settings._fields),
+    @app.callback(Output("exp-folder", "children"), *(Output(f"exp-{name}", "value") for name in experiment.Settings._fields),
                   Input("exp-name", "value"))
     def experiment_folder(name):
         folder = named_folder(name or "")
         if os.path.isdir(folder):
-            return f"continues {folder} ({len(load_trials(folder))} trials)", *trials.load_settings(folder)
-        return f"saved to {folder}", *(no_update for _ in trials.Settings._fields)
+            return f"continues {folder} ({len(load_trials(folder))} trials)", *experiment.load_settings(folder)
+        return f"saved to {folder}", *(no_update for _ in experiment.Settings._fields)
 
     held_payloads: dict[tuple, dict | None] = {}  # per folder, mode and trial count: the best profile takes a fit
 
@@ -952,8 +952,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
             tunnel.start(controller_command(state["repo"], state.get("bundle"), remote, script, pull))
         return False
 
-    def session_status(last: dict | None, current: dict | None, history: list[trials.Trial], segment: dict,
-                       window: dict, settings: trials.Settings) -> Status:
+    def session_status(last: dict | None, current: dict | None, history: list[experiment.Trial], segment: dict,
+                       window: dict, settings: experiment.Settings) -> Status:
         """Where the session is, from the tunnel, the controller, its stream and the experiment."""
         tunnel = cast(Tunnel, state["tunnel"])
         name = state["session"]["name"]
@@ -1022,11 +1022,11 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         Input("stop", "n_clicks"), Input("reconnect", "n_clicks"),
         Input("metabolic-start", "n_clicks"), Input("fast", "n_intervals"),
         State("metabolic-condition", "value"), State("metabolic-label", "value"),
-        State("exp-name", "value"), *(State(f"exp-{name}", "value") for name in trials.Settings._fields),
+        State("exp-name", "value"), *(State(f"exp-{name}", "value") for name in experiment.Settings._fields),
     )
     def status(*args):
         """Act on a click, then render the session from server state (so a dropped response heals on the next tick)."""
-        fields = len(trials.Settings._fields)
+        fields = len(experiment.Settings._fields)
         name, values = args[-1 - fields], args[-fields:]
         condition, label = args[-3 - fields:-1 - fields]
         if state["session"] is None or state["session"]["name"] is None:
@@ -1056,16 +1056,16 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         elif trigger == "start" and not busy() and name and name.strip():
             # a cleared field keeps its default; bo-loop clamps the gait counts
             folder = named_folder(name)
-            trials.save_settings(folder, trials.Settings(*(default if v is None else type(default)(v)
+            experiment.save_settings(folder, experiment.Settings(*(default if v is None else type(default)(v)
                                                            for default, v in zip(defaults, values))))
             run.update(exp_dir=folder, opened=True, process=None, metabolic=None)
-            stream_path["path"] = Path(folder) / "data" / trials.STREAM
+            stream_path["path"] = Path(folder) / "data" / experiment.STREAM
         elif trigger == "close-experiment" and not busy():
             run.update(opened=False, process=None, metabolic=None)
             stream_path["path"] = None
         elif trigger == "optimize" and run["opened"] and not busy():
-            options = trials.load_settings(run["exp_dir"])._asdict()
-            run.update(process=launch_bo_loop(run["exp_dir"], host, options), started=time.monotonic(),
+            options = experiment.load_settings(run["exp_dir"])._asdict()
+            run.update(process=launch_optimization(run["exp_dir"], host, options), started=time.monotonic(),
                        t0=buffer[-1]["time"] if buffer else None, metabolic=None)
         elif trigger == "metabolic-start" and run["opened"] and not busy():
             folder, payload, problem = metabolic_mode(condition)
@@ -1082,8 +1082,8 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
         data = list(buffer)
         last = data[-1] if data and time.monotonic() - received["at"] < STALE_AFTER else None
         window = columns([x for x in data if x["time"] > data[-1]["time"] - LIVE_WINDOW]) if data else {}
-        current = trials.load_current(run["exp_dir"]) if busy() else None
-        history, settings = load_trials(run["exp_dir"]), trials.load_settings(run["exp_dir"])
+        current = experiment.load_current(run["exp_dir"]) if busy() else None
+        history, settings = load_trials(run["exp_dir"]), experiment.load_settings(run["exp_dir"])
         segment = columns([x for x in data if current and x["profile_id"] == current["id"] and x["gain"] >= 1]
                           [settings.warmup:])
         now = session_status(last, current, history, segment, window, settings)
@@ -1107,12 +1107,12 @@ def run_dashboard(exp_dir: str, host: str, port: int, exo: tuple[str, str, int],
 
         dot = {"error": "error", "busy": "busy"}.get(now.tone, "ok") if now.step or now.tone != "busy" else "busy"
         pill = [html.Span(className=f"dot {dot}"), html.B(state["session"]["name"]), tunnel.target]
-        experiment = [html.Span("experiment"), html.B(os.path.basename(run["exp_dir"]))] if run["opened"] else []
+        experiment_tag = [html.Span("experiment"), html.B(os.path.basename(run["exp_dir"]))] if run["opened"] else []
         return (
             f"status tone-{now.tone}", steps, now.eyebrow or f"step {now.step + 1} of {len(STEPS)}", now.title,
             now.detail, progress_bar(*now.progress) if now.progress else None,
             *(shown(id) for id in actions), log, summary, not running,
-            [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment, busy(),
+            [tile(*t) for t in live_tiles(window, last, segment, history, settings)], pill, experiment_tag, busy(),
             "Stop and save the recording" if recording_active() else "Stop optimization",
         )
 
@@ -1208,7 +1208,7 @@ def main():
     parser.add_argument("--exo-host", default="", help="manual new host's default address")
     parser.add_argument("--exo-user", default="pi", help="ssh user on the Pi")
     parser.add_argument("--exo-port", type=int, default=22, help="ssh port on the Pi")
-    parser.add_argument("--atoms", type=int, default=trials.DEFAULT.atoms, help="new experiment default (as bo-loop)")
+    parser.add_argument("--atoms", type=int, default=experiment.DEFAULT.atoms, help="new experiment default (as bo-loop)")
     parser.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)  # simulated legs on the host
     parser.add_argument("--diagnose", action="store_true", help="run the drive check instead of the controller")
     args = parser.parse_args()

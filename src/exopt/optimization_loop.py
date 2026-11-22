@@ -11,7 +11,11 @@ import argparse
 import os
 import signal
 import threading
+import time
 import uuid
+
+import numpy as np
+import zmq
 
 from einops import rearrange
 from bofus import acquisition
@@ -19,14 +23,14 @@ from bofus.gp import GaussianProcess
 from bofus.rkhs import X_MAX, RBFMixture
 from bofus.utils import latin_hypercube_sample, rescale
 
-from exopt import link, trials
-from exopt.controller import MAX_TORQUE, PERIODIC
+from exopt import experiment, streams
+from exopt.control_loop import MAX_TORQUE, PERIODIC
 from exopt.review import write_review
 
 MAX_CAPACITY = 1024  # largest history capacity compiled ahead
 
 
-def variance_range(settings: trials.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
+def variance_range(settings: experiment.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
     """Atom variances l (domain [-X_MAX, X_MAX] for the cycle) of the settings' lengthscales in rad of gait phase."""
     to_variance = lambda lengthscale: jnp.asarray((lengthscale * X_MAX / jnp.pi) ** 2)
     return to_variance(settings.min_lengthscale), to_variance(settings.max_lengthscale)
@@ -103,13 +107,13 @@ def posterior_means(key: Key, history: RBFMixture, ys: Float[Array, "n"], y_stds
     return jnp.where(jnp.isfinite(ys), jnp.ravel(mean), jnp.inf)
 
 
-def best_trial(history: list[trials.Trial], settings: trials.Settings) -> trials.Trial:
+def best_trial(history: list[experiment.Trial], settings: experiment.Settings) -> experiment.Trial:
     """The trial whose profile has the lowest posterior mean loss."""
     stacked = stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history])
     return history[int(posterior_means(jr.key(settings.seed), *stacked).argmin())]
 
 
-def compile_ahead(history: list[trials.Trial], settings: trials.Settings) -> None:
+def compile_ahead(history: list[experiment.Trial], settings: experiment.Settings) -> None:
     """Compile the proposal for each coming history capacity, so none stalls the session; jit reuses them."""
     profiles = [t.profile for t in history] or [jax.tree.map(lambda z: z[0], design(
         jr.key(0), settings.atoms, 1, variance_range(settings)))]
@@ -122,7 +126,7 @@ def compile_ahead(history: list[trials.Trial], settings: trials.Settings) -> Non
         size *= 2
 
 
-def next_profile(key: Key, history: list[trials.Trial], settings: trials.Settings) -> tuple[RBFMixture, dict | None]:
+def next_profile(key: Key, history: list[experiment.Trial], settings: experiment.Settings) -> tuple[RBFMixture, dict | None]:
     """Initial design until it is exhausted, then the BO proposal with the best posterior."""
     key_design, key_search = jr.split(key)
     if len(history) < settings.n:
@@ -144,55 +148,93 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="localhost", help="controller host (tunnel endpoint)")
     parser.add_argument("--exp-dir", default="experiments/mock", help="folder recording the session")
-    for name, default in trials.DEFAULT._asdict().items():
-        label, hint = trials.SETTINGS_HELP[name]
+    for name, default in experiment.DEFAULT._asdict().items():
+        label, hint = experiment.SETTINGS_HELP[name]
         parser.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default,
                             help=f"{label}{f': {hint}' if hint else ''} (default {default})")
     args = parser.parse_args()
-    settings = trials.Settings(**{name: getattr(args, name) for name in trials.Settings._fields})
+    settings = experiment.Settings(**{name: getattr(args, name) for name in experiment.Settings._fields})
     # an SE needs 2 gaits
     settings = settings._replace(min_gaits=max(settings.min_gaits, 2))
     settings = settings._replace(max_gaits=max(settings.max_gaits, settings.min_gaits))
     if not abs(settings.power_assist) < MAX_TORQUE:
         parser.error(f"--power-assist must be below the {MAX_TORQUE:g} Nm torque limit")
     # every trial of the folder is scored under the settings it last ran with
-    trials.save_settings(args.exp_dir, settings)
+    experiment.save_settings(args.exp_dir, settings)
 
     # SIGINT stops the session cleanly even when launched with it ignored (a background job)
     signal.signal(signal.SIGINT, signal.default_int_handler)
     if os.name == "nt":  # the dashboard's stop on Windows is a ctrl-break
         signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
-    samples, profiles = link.driver_link(args.host)
+    samples, profiles = streams.driver_link(args.host)
     try:
         run_session(samples, profiles, args.exp_dir, settings)
     except ConnectionError as error:
         print(f"Stopped: {error}")
     finally:
-        link.release(profiles)
+        streams.release(profiles)
         print(f"Review in {write_review(args.exp_dir)}")
 
 
-def run_session(samples, profiles, exp_dir: str, settings: trials.Settings) -> None:
+def collect_segment(samples: zmq.Socket, profiles: zmq.Socket, payload: dict, settings: experiment.Settings) -> tuple[list[dict], str]:
+    """Publish the profile and gather samples until payload["stop_rule"] stops it (experiment.stop_reason), and why.
+
+    The warm-up counts from the end of the controller's ramp up; valid gaits (experiment.gait_slices) count after it. The segment
+    returned ends with a gait. Raises ConnectionError after streams.STALL seconds without samples (the controller streams from
+    startup).
+    """
+    collected, phase = [], None
+    rule = payload["stop_rule"]
+    published_at, heard_at = None, time.monotonic()
+    while True:
+        # republish every second until the profile is fully ramped up (slow-joiner losses)
+        if not collected and (published_at is None or time.monotonic() - published_at > 1.0):
+            profiles.send_json(payload)
+            published_at = time.monotonic()
+        if not samples.poll(100):
+            if time.monotonic() - heard_at > streams.STALL:
+                raise ConnectionError(f"no samples from the controller for {streams.STALL:g} s")
+            continue
+
+        # keep only samples of the requested profile, once ramped up to full gain
+        sample = samples.recv_json()
+        heard_at = time.monotonic()
+        if sample["profile_id"] != payload["id"] or sample["gain"] < 1.0:
+            continue
+        collected.append(sample)
+        if len(collected) <= settings.warmup:
+            continue
+
+        # a gait ends where leg 0's phase wraps: check the rule on the segment up to it
+        wrapped = None not in (phase, sample["phase_0"]) and sample["phase_0"] - phase < -np.pi
+        phase = sample["phase_0"]
+        if wrapped:
+            segment = collected[settings.warmup:-1]
+            if reason := experiment.stop_reason(*experiment.gait_estimate(experiment.columns(segment), settings), rule, settings):
+                return segment, reason
+
+
+def run_session(samples, profiles, exp_dir: str, settings: experiment.Settings) -> None:
     """Propose, ramp up, collect, release, record, until interrupted or the controller is gone."""
     # compiled while the first trials run (the initial design needs none)
-    threading.Thread(target=compile_ahead, args=(trials.load(exp_dir), settings), daemon=True).start()
+    threading.Thread(target=compile_ahead, args=(experiment.load(exp_dir), settings), daemon=True).start()
     while True:
-        history = trials.load(exp_dir)
+        history = experiment.load(exp_dir)
         profile, best = next_profile(jr.key(settings.seed), history, settings)
 
         # a fresh id per publish, so the controller never mistakes it for a stale profile
         index = max((t.index for t in history), default=0) + 1
-        payload = trials.encode_profile(profile) | dict(id=f"{index}-{uuid.uuid4().hex[:6]}",
+        payload = experiment.encode_profile(profile) | dict(id=f"{index}-{uuid.uuid4().hex[:6]}",
                                                         ramp_cycles=settings.ramp_cycles, power_assist=settings.power_assist,
                                                         stop_rule=best or {})
-        trials.save_current(exp_dir, payload)
-        collected, reason = link.collect_segment(samples, profiles, payload, settings)
+        experiment.save_current(exp_dir, payload)
+        collected, reason = collect_segment(samples, profiles, payload, settings)
         # ramp down to zero while the next proposal is computed
-        link.release(profiles)
-        trial = trials.save(exp_dir, index, profile, collected, settings)
+        streams.release(profiles)
+        trial = experiment.save(exp_dir, index, profile, collected, settings)
         best = min([t.loss for t in history] + [trial.loss])
-        print(f"trial {index}: {len(trials.gait_slices(trial.samples, settings))} valid gaits ({reason}), loss {trial.loss:.4f} ± {trial.se:.4f} (best {best:.4f})")
+        print(f"trial {index}: {len(experiment.gait_slices(trial.samples, settings))} valid gaits ({reason}), loss {trial.loss:.4f} ± {trial.se:.4f} (best {best:.4f})")
 
 
 if __name__ == "__main__":

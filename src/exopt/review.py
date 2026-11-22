@@ -10,7 +10,7 @@ import webbrowser
 import plotly.graph_objects as go
 from plotly.offline import get_plotlyjs
 
-from exopt import trials
+from exopt import experiment
 from exopt.figures import (CLICKABLE, DARK, LIGHT, PAGE_CSS, TRIAL, WEB, animation_figure, estimate_figure, experiment_figure,
                            loss_figure, portrait_figure,
                            power_figure, profile_figure, profiles_figure, review_headline, trial_summary)
@@ -27,7 +27,7 @@ DARK_COLORS = {
 
 def review_html(exp_dir: str) -> str:
     """The review page of the experiment in exp_dir, plotly included, so it opens offline."""
-    history = trials.load(exp_dir)
+    history = experiment.load(exp_dir)
     name = Path(exp_dir).resolve().name
     to_json = lambda figure: go.Figure(figure).to_json()
 
@@ -97,6 +97,6 @@ def main():
         print(f"Wrote {write_review(args.exp_dir)}")
         return
     out = Path(args.exp_dir) / "animation.html"
-    animation_figure(trials.load(args.exp_dir), args.swing, args.fps).write_html(out, auto_play=False)
+    animation_figure(experiment.load(args.exp_dir), args.swing, args.fps).write_html(out, auto_play=False)
     print(f"Wrote {out}")
     webbrowser.open(out.resolve().as_uri())

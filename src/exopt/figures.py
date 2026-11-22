@@ -10,8 +10,8 @@ import plotly.graph_objects as go
 from bofus.rkhs import X_MAX, RBFMixture
 from einops import rearrange
 
-from exopt import trials
-from exopt.controller import MAX_TORQUE, PERIODIC, power_assist_torque, profile_torque, unit_phase
+from exopt import experiment
+from exopt.control_loop import MAX_TORQUE, PERIODIC, power_assist_torque, profile_torque, unit_phase
 
 LIVE_WINDOW = 10.0  # [s] of leg traces in the running view
 LIVE_STRIDE = 3  # plot every 3rd sample of the traces, so a refresh stays cheap
@@ -80,10 +80,10 @@ def gait_period(s: dict[str, np.ndarray]) -> float | None:
     return float(np.median(np.diff(wraps))) if len(wraps) >= 3 else None
 
 
-def running_estimate(samples: dict[str, np.ndarray], settings: trials.Settings
+def running_estimate(samples: dict[str, np.ndarray], settings: experiment.Settings
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample index, loss and SE at the end of each valid gait from the second on, as trials.gait_estimate gives them."""
-    power, gaits = trials.penalized_power(samples, settings.beta), trials.gait_slices(samples, settings)
+    """Sample index, loss and SE at the end of each valid gait from the second on, as experiment.gait_estimate gives them."""
+    power, gaits = experiment.penalized_power(samples, settings.beta), experiment.gait_slices(samples, settings)
     per_gait = np.array([-power[gait].mean() for gait in gaits])
     at, loss, se = [], [], []
     for k in range(2, len(gaits) + 1):
@@ -182,7 +182,7 @@ def profile_figure(
     return styled(p, phase_axis(fig), title)
 
 
-def estimate_figure(title: str, samples: dict, settings: trials.Settings, rule: dict | None = None, p: Palette = LIGHT
+def estimate_figure(title: str, samples: dict, settings: experiment.Settings, rule: dict | None = None, p: Palette = LIGHT
                     ) -> go.Figure | dict:
     """Loss estimate of a segment ± z SE at each valid gait, against the best observed profile's pessimistic mean.
 
@@ -201,7 +201,7 @@ def estimate_figure(title: str, samples: dict, settings: trials.Settings, rule: 
     layout = layout_style(p, title) | dict(xaxis=axis_style(p) | dict(title=dict(text="time in segment (s)")),
                                            yaxis=axis_style(p) | dict(title=dict(text="loss")))
     if rule and "best_mean" in rule:
-        best = np.full_like(loss, trials.pessimistic_best(rule, z))
+        best = np.full_like(loss, experiment.pessimistic_best(rule, z))
         data.append(line(best, f"best (posterior mean + {z:g} sd)", line=dict(color=p.muted, width=1.5, dash="dash"),
                          hoverinfo="skip"))
     data += [band(loss - z * se, loss + z * se, p.band, f"segment ± {z:g} SE"),
@@ -244,7 +244,7 @@ def live_figure(s: dict[str, np.ndarray], p: Palette = LIGHT, stride: int = LIVE
 
 
 def experiment_regions(
-    s: dict[str, np.ndarray], history: list[trials.Trial], events: list[tuple[int, dict]], experiment_time: np.ndarray
+    s: dict[str, np.ndarray], history: list[experiment.Trial], events: list[tuple[int, dict]], experiment_time: np.ndarray
 ) -> list[tuple[str, float, float]]:
     """Spans of each sample's part of the experiment: a scored trial, a metabolic recording, a torque ramp, unscored
     full torque, a stage."""
@@ -271,9 +271,9 @@ def experiment_regions(
     return regions
 
 
-def experiment_figure(exp_dir: str, history: list[trials.Trial], p: Palette = LIGHT) -> dict:
+def experiment_figure(exp_dir: str, history: list[experiment.Trial], p: Palette = LIGHT) -> dict:
     """Leg signals over the whole experiment, shaded by trial and transition; the trials alone before stream records."""
-    s, events = trials.load_stream(exp_dir, EXPERIMENT_POINTS)
+    s, events = experiment.load_stream(exp_dir, EXPERIMENT_POINTS)
     recorded = bool(s)
     if not recorded:
         if not history:
@@ -320,7 +320,7 @@ def experiment_figure(exp_dir: str, history: list[trials.Trial], p: Palette = LI
     return fig
 
 
-def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
+def loss_figure(history: list[experiment.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
     title = "loss per trial"
     if not history:
         return placeholder(p, "no trials yet", title, 320)
@@ -347,7 +347,7 @@ def loss_figure(history: list[trials.Trial], selected: int | None, p: Palette = 
     return styled(p, fig, title, 320)
 
 
-def profiles_figure(history: list[trials.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
+def profiles_figure(history: list[experiment.Trial], selected: int | None, p: Palette = LIGHT) -> go.Figure:
     title = "profiles tried"
     if not history:
         return placeholder(p, "no trials yet", title, 320)
@@ -369,7 +369,7 @@ def profiles_figure(history: list[trials.Trial], selected: int | None, p: Palett
     return styled(p, phase_axis(fig), title, 320)
 
 
-def power_figure(trial: trials.Trial, p: Palette = LIGHT) -> go.Figure:
+def power_figure(trial: experiment.Trial, p: Palette = LIGHT) -> go.Figure:
     """Mean penalized power per gait-phase bin: where the loss is earned."""
     s, edges = trial.samples, np.linspace(0, 1, POWER_BINS + 1)
     fig = go.Figure().add_hline(y=0, line=dict(color=p.axis, width=1))
@@ -384,7 +384,7 @@ def power_figure(trial: trials.Trial, p: Palette = LIGHT) -> go.Figure:
     return styled(p, phase_axis(fig), "power over the gait cycle")
 
 
-def portrait_figure(trial: trials.Trial, p: Palette = LIGHT) -> go.Figure:
+def portrait_figure(trial: experiment.Trial, p: Palette = LIGHT) -> go.Figure:
     s, fig = trial.samples, go.Figure()
     for leg in (0, 1):
         fig.add_scatter(x=s[f"position_{leg}"], y=s[f"velocity_{leg}"], mode="lines", name=f"leg {leg}",
@@ -394,9 +394,9 @@ def portrait_figure(trial: trials.Trial, p: Palette = LIGHT) -> go.Figure:
     return styled(p, fig, "phase portrait")
 
 
-def trial_summary(trial: trials.Trial) -> str:
+def trial_summary(trial: experiment.Trial) -> str:
     s, p = trial.samples, trial.profile
-    return (f"trial {trial.index} · loss {trial.loss:.3f} ± {trial.se:.3f} · {len(trials.gait_slices(s, trial.settings))} valid gaits, "
+    return (f"trial {trial.index} · loss {trial.loss:.3f} ± {trial.se:.3f} · {len(experiment.gait_slices(s, trial.settings))} valid gaits, "
             f"{s['time'][-1] - s['time'][0]:.1f} s · {p.a.shape[-1]} atoms")
 
 
@@ -418,21 +418,21 @@ PAGE_CSS = f"""
 """ + (WEB / "style.css").read_text()
 
 
-def load_trials(exp_dir: str) -> list[trials.Trial]:
+def load_trials(exp_dir: str) -> list[experiment.Trial]:
     """The folder's trials, none if it holds an older format."""
     try:
-        return trials.load(exp_dir)
+        return experiment.load(exp_dir)
     except (KeyError, TypeError, ValueError, OSError):
         return []
 
 
-def review_headline(history: list[trials.Trial]) -> str:
+def review_headline(history: list[experiment.Trial]) -> str:
     """Trial count and the best trial."""
     best = min(history, key=lambda t: t.loss)
     return f"{len(history)} trials · best trial {best.index}, loss {best.loss:.3f}"
 
 
-def animation_figure(history: list[trials.Trial], swing: float = 45.0, fps: float = 25.0) -> go.Figure:
+def animation_figure(history: list[experiment.Trial], swing: float = 45.0, fps: float = 25.0) -> go.Figure:
     """Side-view animation of the gait: fixed hip pivot, two swinging legs, one segment per trial."""
     # resample every trial onto a uniform real-time grid
     segments = []
@@ -456,7 +456,7 @@ def animation_figure(history: list[trials.Trial], swing: float = 45.0, fps: floa
             for leg, a in enumerate(angles)
         ]
 
-    def banner(trial: trials.Trial) -> list[dict]:
+    def banner(trial: experiment.Trial) -> list[dict]:
         return [dict(text=f"trial {trial.index} — loss {trial.loss:.2f}", x=0.5, y=1.05,
                      xref="paper", yref="paper", showarrow=False, font=dict(size=18))]
 

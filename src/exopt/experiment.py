@@ -6,9 +6,10 @@ import math
 import threading
 import time
 
-import jax.numpy as jnp
 import numpy as np
 from bofus.rkhs import RBFMixture
+
+from exopt.control_loop import decode_profile, encode_profile
 
 BATCHES = 10  # batch means for the standard error of segments with fewer than 2 valid gaits (older trials)
 FULL_CYCLE = 0.95 * 2 * np.pi  # phase span of a complete gait, so a cut one (a segment's first) is left out
@@ -153,14 +154,6 @@ def stop_reason(loss: float, se: float, gaits: int, rule: dict, settings: Settin
     if se < rule["mean_sd"]:
         return "precise enough"
     return None
-
-
-def encode_profile(profile: RBFMixture) -> dict:
-    return {k: v.tolist() for k, v in profile._asdict().items()}
-
-
-def decode_profile(payload: dict) -> RBFMixture:
-    return RBFMixture(*(jnp.asarray(payload[k], dtype=float) for k in RBFMixture._fields))
 
 
 class Trial(NamedTuple):

@@ -8,9 +8,9 @@ each connect sends the controller host this checkout's commits over ssh (cloning
 
 ```bash
 scripts/pi-hotspot.sh <password>                   # once on the Pi: its own wifi "exo-pi", Pi at 10.42.0.1 (controller "pi (hotspot)")
-uv run --group controller src/exopt/controller.py   # on the Pi
+uv run --group controller src/exopt/control_loop.py   # on the Pi
 uv run --group controller src/exopt/diagnose.py     # on the Pi: drives answer and track a gait torque (or start --diagnose)
-uv run src/exopt/mock_controller.py                 # simulated legs
+uv run src/exopt/drives_mock.py                 # simulated legs
 uv run --group optimizer bo-loop --exp-dir <dir> [--atoms 2]
 uv run --group optimizer start <dir>                # dashboard
 uv run --group optimizer exo-review <dir>           # static <dir>/dashboard.html (--animation: gait animation)

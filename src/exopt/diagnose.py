@@ -1,14 +1,14 @@
 """Drive check: both drives answer, then apply a 1 Nm periodic gait torque until stopped, reporting tracking."""
 
 import signal
-import sys
 import time
 
 import numpy as np
 from jaxtyping import Float
 
-from exopt import link
-from exopt.controller import MAX_TORQUE, SAMPLING_STEP
+from exopt import streams
+from exopt.control_loop import SAMPLING_STEP
+from exopt.drives_md80 import Drives
 
 GAIT_PERIOD = 1.1  # [s] of the applied torque, legs half a period apart
 AMPLITUDE = 1.0  # [Nm] of the gait torque, ramped into over the first cycle
@@ -44,91 +44,61 @@ def longest_stall(time_s: Float[np.ndarray, "T"], reads: Float[np.ndarray, "T K"
     return float(np.diff(change_times).max(initial=0.0))
 
 
-def print_status(candle, ids: list[int]) -> None:
-    # quick status where this pyCandle has it: bit 14 set means the drive stage is off
-    for id, md in zip(ids, candle.md80s):
-        if (status := getattr(md, "getQuickStatus", None)) is not None:
-            print(f"  drive {id}: quick status {status():#06x}")
-
-
 if __name__ == "__main__":
-    import pyCandle
-
-    # connection: both drives answer and enable in raw torque mode
-    candle = pyCandle.Candle(pyCandle.CAN_BAUD_1M, True)
-    ids = candle.ping()
-    print(f"drives found on the CAN bus: {ids}")
-    if len(ids) < 2:
-        sys.exit("FAIL: expected 2 drives: check the CAN cable, the drives' power and the CANdle USB")
-    ids = ids[:2]
-    for id in ids:
-        candle.addMd80(id)
-    for id, md in zip(ids, candle.md80s):
-        if not candle.controlMd80Mode(id, pyCandle.RAW_TORQUE) or not candle.controlMd80Enable(id, True):
-            sys.exit(f"FAIL: drive {id} refused raw torque mode or enabling")
-        md.setMaxTorque(MAX_TORQUE)
-    candle.begin()
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, signal.default_int_handler)
 
-    # samples stream to the dashboard's live view as the controller's do
-    samples, profiles = link.controller_link()
-    peers, waited_since = link.Peers(samples, profiles), time.monotonic()
-    print("waiting for the dashboard to connect...")
-    while not peers() and time.monotonic() - waited_since < VIEWER_WAIT:
-        time.sleep(0.1)
-    print("dashboard connected" if peers() else "no dashboard connected: running without the live view")
+    with Drives() as drives:
+        # samples stream to the dashboard's live view as the controller's do
+        samples, profiles = streams.controller_link()
+        peers, waited_since = streams.Peers(samples, profiles), time.monotonic()
+        print("waiting for the dashboard to connect...")
+        while not peers() and time.monotonic() - waited_since < VIEWER_WAIT:
+            time.sleep(0.1)
+        print("dashboard connected" if peers() else "no dashboard connected: running without the live view")
 
-    # apply the gait torque until ctrl-c, streaming samples and reporting each stretch's tracking
-    print(f"applying a {AMPLITUDE:g} Nm, {GAIT_PERIOD} s gait torque, legs in antiphase, until stopped")
-    stretch, start = [], time.monotonic()
-    next_tick, next_report, longest = start, REPORT_CYCLES * GAIT_PERIOD, 0.0
-    try:
-        while True:
-            t = time.monotonic() - start
-            position = np.array([md.getPosition() for md in candle.md80s])
-            velocity = np.array([md.getVelocity() for md in candle.md80s])
-            measured = np.array([md.getTorque() for md in candle.md80s])
-            gain = min(t / GAIT_PERIOD, 1.0)
-            phase = (2 * np.pi * t / GAIT_PERIOD + np.pi * np.arange(2)) % (2 * np.pi)
-            commanded = gain * AMPLITUDE * np.sin(phase)
-            for md, torque in zip(candle.md80s, commanded):
-                md.setTargetTorque(float(torque))
-            stretch.append(np.concatenate([[t], commanded, measured, velocity, position]))
-            columns = dict(phase=phase, position=position, velocity=velocity, torque=commanded,
-                           measured_torque=measured)
-            samples.send_json(
-                dict(time=t, stage="running", profile_id=None, gain=gain)
-                | {f"{name}_{leg}": float(values[leg]) for name, values in columns.items() for leg in (0, 1)}
-            )
+        # apply the gait torque until ctrl-c, streaming samples and reporting each stretch's tracking
+        print(f"applying a {AMPLITUDE:g} Nm, {GAIT_PERIOD} s gait torque, legs in antiphase, until stopped")
+        stretch, start = [], time.monotonic()
+        next_tick, next_report, longest = start, REPORT_CYCLES * GAIT_PERIOD, 0.0
+        try:
+            while True:
+                t = time.monotonic() - start
+                position, velocity, measured = drives.read(t)
 
-            if t >= next_report:
-                log = np.array(stretch)
-                working = True
-                for leg, id in enumerate(ids):
-                    # a drive silent on the bus leaves pyCandle repeating its last reads
-                    stall = longest_stall(log[:, 0], log[:, [3 + leg, 5 + leg, 7 + leg]])
-                    longest = max(longest, stall)
-                    fit_gain, damping, residual = fit_tracking(log[:, 1 + leg], log[:, 3 + leg], log[:, 5 + leg])
-                    outcome = verdict(fit_gain, damping)
-                    if stall >= 0.9 * (log[-1, 0] - log[0, 0]):
-                        outcome = "NO FRESH READS (drive silent on the CAN bus, values are the last ones it sent)"
-                    elif stall >= STALL_REPORTED:
-                        outcome += f", reads frozen for {stall:.2f} s"
-                    working &= outcome == "ok"
-                    print(f"t={t:5.0f} s drive {id}: measured = {fit_gain:+.2f} x commanded {damping:+.2f} "
-                          f"x velocity (rms {residual:.2f} Nm), moved {np.ptp(log[:, 7 + leg]):.3f} rad: {outcome}")
-                if not working:
-                    print_status(candle, ids)
-                stretch, next_report = [], next_report + REPORT_CYCLES * GAIT_PERIOD
+                gain = min(t / GAIT_PERIOD, 1.0)
+                phase = (2 * np.pi * t / GAIT_PERIOD + np.pi * np.arange(2)) % (2 * np.pi)
+                commanded = gain * AMPLITUDE * np.sin(phase)
+                drives.apply(commanded)
+                stretch.append(np.concatenate([[t], commanded, measured, velocity, position]))
+                columns = dict(phase=phase, position=position, velocity=velocity, torque=commanded,
+                               measured_torque=measured)
+                samples.send_json(
+                    dict(time=t, stage="running", profile_id=None, gain=gain)
+                    | {f"{name}_{leg}": float(values[leg]) for name, values in columns.items() for leg in (0, 1)}
+                )
 
-            next_tick = max(next_tick + SAMPLING_STEP, time.monotonic())
-            time.sleep(max(next_tick - time.monotonic(), 0.0))
-    except KeyboardInterrupt:
-        print(f"stopped: longest read freeze {longest:.2f} s")
-    finally:
-        for md in candle.md80s:
-            md.setTargetTorque(0.0)
-        candle.end()
-        for id in ids:
-            candle.controlMd80Enable(id, False)
+                if t >= next_report:
+                    log = np.array(stretch)
+                    working = True
+                    for leg, id in enumerate(drives.ids):
+                        # a drive silent on the bus leaves pyCandle repeating its last reads
+                        stall = longest_stall(log[:, 0], log[:, [3 + leg, 5 + leg, 7 + leg]])
+                        longest = max(longest, stall)
+                        fit_gain, damping, residual = fit_tracking(log[:, 1 + leg], log[:, 3 + leg], log[:, 5 + leg])
+                        outcome = verdict(fit_gain, damping)
+                        if stall >= 0.9 * (log[-1, 0] - log[0, 0]):
+                            outcome = "NO FRESH READS (drive silent on the CAN bus, values are the last ones it sent)"
+                        elif stall >= STALL_REPORTED:
+                            outcome += f", reads frozen for {stall:.2f} s"
+                        working &= outcome == "ok"
+                        print(f"t={t:5.0f} s drive {id}: measured = {fit_gain:+.2f} x commanded {damping:+.2f} "
+                              f"x velocity (rms {residual:.2f} Nm), moved {np.ptp(log[:, 7 + leg]):.3f} rad: {outcome}")
+                    if not working:
+                        drives.print_status()
+                    stretch, next_report = [], next_report + REPORT_CYCLES * GAIT_PERIOD
+
+                next_tick = max(next_tick + SAMPLING_STEP, time.monotonic())
+                time.sleep(max(next_tick - time.monotonic(), 0.0))
+        except KeyboardInterrupt:
+            print(f"stopped: longest read freeze {longest:.2f} s")
