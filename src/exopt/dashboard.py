@@ -69,8 +69,8 @@ def experiment_folders(experiments: str) -> list[str]:
 
 STEPS = ("Connect", "Walk", "Experiment")
 MOVING_SPEED = 0.15  # [rad/s] the controller's still-standing threshold
-BASIC_SETTINGS = ("seed", "atoms", "power_assist", "beta", "n")  # shown, the rest under Advanced
-STOP_WORDS = {"max gaits": "reached the maximum number of gaits", "initial design": "initial-design profile, minimum reached",
+BASIC_SETTINGS = ("seed", "atoms", "power_assist", "beta")  # shown, the rest under Advanced
+STOP_WORDS = {"max gaits": "reached the maximum number of gaits", "seed": "power assist seed, minimum reached",
               "worse than best": "clearly worse than the best so far", "precise enough": "measured precisely enough"}
 
 
@@ -96,7 +96,7 @@ def trial_status(last: dict, current: dict | None, history: list[experiment.Tria
         return Status(2, "busy", "Starting the experiment", "Preparing the first profile. Keep walking.", "stop",
                       "experiment")
     index, rule = int(current["id"].split("-")[0]), current.get("stop_rule", {})
-    eyebrow = f"trial {index} · " + ("initial design" if "best_mean" not in rule else "optimizing")
+    eyebrow = f"trial {index} · " + ("power assist seed" if "best_mean" not in rule else "optimizing")
     if history and history[-1].index == index:
         t = history[-1]
         return Status(2, "busy", "Choosing the next profile",

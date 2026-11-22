@@ -22,7 +22,6 @@ class Settings(NamedTuple):
     """An experiment's settings, recorded in <exp_dir>/settings.json."""
 
     atoms: int = 4
-    n: int = 4
     min_gaits: int = 10
     max_gaits: int = 20
     beta: float = 5.0
@@ -43,7 +42,6 @@ class Settings(NamedTuple):
 DEFAULT = Settings()
 SETTINGS_HELP = dict(  # (label, hint) per setting, for the dashboard form and bo-loop --help
     atoms=("Atoms per profile", "RBF bumps summed into one torque profile"),
-    n=("Initial design", "random profiles before optimizing"),
     min_gaits=("Min valid gaits per profile", "at least 2, for a standard error"),
     max_gaits=("Max valid gaits per profile", None),
     beta=("Resistive power weight", "negative power counts this many times in the loss"),
@@ -55,7 +53,7 @@ SETTINGS_HELP = dict(  # (label, hint) per setting, for the dashboard form and b
     ramp_cycles=("Torque ramp (gait cycles)", "ramp up and down between profiles"),
     min_lengthscale=("Narrowest atom (rad)", "atom lengthscale in gait phase, 2π a cycle"),
     max_lengthscale=("Widest atom (rad)", None),
-    seed=("Seed", "initial design and search starts"),
+    seed=("Seed", "search starts"),
     raw_samples=("Acquisition probes", "random candidates scored before refining"),
     max_restarts=("Acquisition restarts", "candidates refined by gradient ascent"),
     power_assist=("Power assist peak (Nm)", "profiles are offsets from torque in phase with the velocity, this peak"),
@@ -141,7 +139,7 @@ def pessimistic_best(rule: dict, z: float) -> float:
 def stop_reason(loss: float, se: float, gaits: int, rule: dict, settings: Settings) -> str | None:
     """Why a segment of `gaits` valid gaits, with this loss and SE, stops now, if it does.
 
-    Between min_gaits and max_gaits it stops in the initial design (no surrogate posterior in the rule), once even its
+    Between min_gaits and max_gaits it stops as a power assist seed (no surrogate posterior in the rule), once even its
     optimistic loss is worse than the best's pessimistic posterior mean, or once its SE is below the mean posterior sd
     at the observed profiles.
     """
@@ -150,7 +148,7 @@ def stop_reason(loss: float, se: float, gaits: int, rule: dict, settings: Settin
     if gaits < settings.min_gaits:
         return None
     if "best_mean" not in rule:
-        return "initial design"
+        return "seed"
     if loss - settings.stop_z * se > pessimistic_best(rule, settings.stop_z):
         return "worse than best"
     if se < rule["mean_sd"]:

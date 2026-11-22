@@ -20,14 +20,17 @@ import zmq
 from einops import rearrange
 from bofus import acquisition
 from bofus.gp import GaussianProcess
-from bofus.rkhs import X_MAX, RBFMixture
-from bofus.utils import latin_hypercube_sample, rescale
+from bofus.rkhs import X_MAX, RBFMixture, distance
 
 from exopt import experiment, streams
 from exopt.control_loop import MAX_TORQUE, PERIODIC
 from exopt.review import write_review
 
 MAX_CAPACITY = 1024  # largest history capacity compiled ahead
+# torque in phase with the velocity: opposite atoms at the two velocity peaks, 1 rad wide (a sinusoid to 2 %)
+POWER_ASSIST = RBFMixture(jnp.full((2, 1), (X_MAX / jnp.pi) ** 2), jnp.array([[0.5], [-0.5]]) * X_MAX,
+                          jnp.array([1.0, -1.0]) * acquisition.A_MAX)
+SEED_INTENSITIES = (0.0, 0.25, 0.5, 0.75, 1.0)  # of the power assist, measured before optimizing
 
 
 def variance_range(settings: experiment.Settings) -> tuple[Float[Array, ""], Float[Array, ""]]:
@@ -36,13 +39,16 @@ def variance_range(settings: experiment.Settings) -> tuple[Float[Array, ""], Flo
     return to_variance(settings.min_lengthscale), to_variance(settings.max_lengthscale)
 
 
-def design(key: Key, atoms: int, n: int, l_range: tuple[Float[Array, ""], Float[Array, ""]]) -> RBFMixture:
-    """Latin hypercube of n profiles over the acquisition's box, stacked."""
-    u = latin_hypercube_sample(key, (n, atoms, 3))
-    log_l = rescale(u[..., 0], *map(jnp.log, l_range))
-    x = rescale(u[..., 1], -X_MAX, X_MAX)
-    a = rescale(u[..., 2], -acquisition.A_MAX, acquisition.A_MAX)
-    return RBFMixture(jnp.exp(log_l)[..., None], x[..., None], a)
+def scaled(profile: RBFMixture, intensity: float) -> RBFMixture:
+    """The profile at an intensity: its amplitudes scaled."""
+    return profile._replace(a=intensity * profile.a)
+
+
+def missing_seeds(history: list[experiment.Trial]) -> list[RBFMixture]:
+    """The power assist intensities no trial has measured yet."""
+    seeds = [scaled(POWER_ASSIST, intensity) for intensity in SEED_INTENSITIES]
+    measured = lambda seed: any(distance(seed, t.profile, periodic=PERIODIC) < 1e-2 for t in history)
+    return [seed for seed in seeds if not measured(seed)]
 
 
 def capacity(trials_count: int) -> int:
@@ -115,9 +121,8 @@ def best_trial(history: list[experiment.Trial], settings: experiment.Settings) -
 
 def compile_ahead(history: list[experiment.Trial], settings: experiment.Settings) -> None:
     """Compile the proposal for each coming history capacity, so none stalls the session; jit reuses them."""
-    profiles = [t.profile for t in history] or [jax.tree.map(lambda z: z[0], design(
-        jr.key(0), settings.atoms, 1, variance_range(settings)))]
-    size = capacity(max(len(history) + 1, settings.n))
+    profiles = [t.profile for t in history] or [POWER_ASSIST]
+    size = capacity(max(len(history) + 1, len(SEED_INTENSITIES)))
     while size <= MAX_CAPACITY:
         propose_next.lower(
             jr.key(0), *stack((profiles * size)[:size], [0.0] * size, [0.0] * size), variance_range(settings),
@@ -127,14 +132,12 @@ def compile_ahead(history: list[experiment.Trial], settings: experiment.Settings
 
 
 def next_profile(key: Key, history: list[experiment.Trial], settings: experiment.Settings) -> tuple[RBFMixture, dict | None]:
-    """Initial design until it is exhausted, then the BO proposal with the best posterior."""
-    key_design, key_search = jr.split(key)
-    if len(history) < settings.n:
-        initial = design(key_design, settings.atoms, settings.n, variance_range(settings))
-        return jax.tree.map(lambda a: a[len(history)], initial), None
+    """The next unmeasured power assist seed, then the BO proposal with the best posterior."""
+    if seeds := missing_seeds(history):
+        return seeds[0], None
 
     candidate, best = propose_next(
-        jr.fold_in(key_search, len(history)),
+        jr.fold_in(key, len(history)),
         *stack([t.profile for t in history], [t.loss for t in history], [t.se for t in history]),
         variance_range(settings),
         atoms=settings.atoms,
@@ -217,7 +220,7 @@ def collect_segment(samples: zmq.Socket, profiles: zmq.Socket, payload: dict, se
 
 def run_session(samples, profiles, exp_dir: str, settings: experiment.Settings) -> None:
     """Propose, ramp up, collect, release, record, until interrupted or the controller is gone."""
-    # compiled while the first trials run (the initial design needs none)
+    # compiled while the seeds run (they need no surrogate)
     threading.Thread(target=compile_ahead, args=(experiment.load(exp_dir), settings), daemon=True).start()
     while True:
         history = experiment.load(exp_dir)
