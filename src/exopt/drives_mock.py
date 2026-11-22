@@ -7,7 +7,6 @@ import time
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
 
 import numpy as np
 from jaxtyping import Float
@@ -46,173 +45,181 @@ BRAKE_DAMPING = 3.4  # [Nm s/rad] faulted drives: measured torque = -BRAKE_DAMPI
 SUBSTEPS = 10  # integration substeps per control step
 
 
-class Legs(NamedTuple):
-    """Hip trajectories fitted to real walking, pushed off course by the applied torque: I e'' + c e' + k e = torque."""
-
-    elapsed: float
-
-    # gait: walking schedule, cadence, stride clock
-    walking: bool
-    envelope: float
-    next_switch: float
-    level: float
-    smooth_level: float
-    drift: float
-    assistance: float
-    next_speed_change: float
-    stride_angle: float
-    stride_period_scale: float
-    stride_amplitudes: Float[np.ndarray, "2"]
-
-    # legs: reference, deviation from it, torques, drive state
-    reference: Float[np.ndarray, "2"]
-    reference_rate: Float[np.ndarray, "2"]
-    deviation: Float[np.ndarray, "2"]
-    deviation_rate: Float[np.ndarray, "2"]
-    commanded: Float[np.ndarray, "2"]
-    applied: Float[np.ndarray, "2"]
-    braking: bool
-
-
 def smoothstep(x: float) -> float:
     return x * x * (3 - 2 * x)
 
 
-def standing_legs(rng: np.random.Generator) -> Legs:
-    """Standing still on the zeroed pose, to start walking after STAND_TIME."""
-    zeros = np.zeros(2)
-    return Legs(
-        elapsed=0.0, walking=False, envelope=0.0, next_switch=STAND_TIME,
-        level=0.0, smooth_level=0.0, drift=0.0, assistance=0.0,
-        next_speed_change=rng.exponential(SPEED_CHANGE_EVERY),
-        stride_angle=0.0, stride_period_scale=1.0, stride_amplitudes=rng.lognormal(0.0, STRIDE_AMPLITUDE_CV, 2),
-        reference=zeros, reference_rate=zeros, deviation=zeros, deviation_rate=zeros,
-        commanded=zeros, applied=zeros, braking=False,
-    )
+class Legs:
+    """Hip trajectories fitted to real walking, pushed off course by the applied torque: I e'' + c e' + k e = torque.
+
+    They start standing still on the zeroed pose, and walk after STAND_TIME."""
+
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
+        self.elapsed = 0.0
+
+        # walking schedule
+        self.walking, self.envelope, self.next_switch = False, 0.0, STAND_TIME
+
+        # log cadence: treadmill speed level, slow drift, assistance felt
+        self.level, self.smooth_level, self.drift, self.assistance = 0.0, 0.0, 0.0, 0.0
+        self.next_speed_change = rng.exponential(SPEED_CHANGE_EVERY)
+
+        # stride clock
+        self.stride_angle, self.stride_period_scale = 0.0, 1.0
+        self.stride_amplitudes: Float[np.ndarray, "2"] = rng.lognormal(0.0, STRIDE_AMPLITUDE_CV, 2)
+
+        # reference trajectory, deviation from it, drives
+        self.reference, self.reference_rate = np.zeros(2), np.zeros(2)
+        self.deviation, self.deviation_rate = np.zeros(2), np.zeros(2)
+        self.commanded = np.zeros(2)
+        self.braking = False  # faulted drives ignore the command
+
+    @property
+    def position(self) -> Float[np.ndarray, "2"]:
+        return self.reference + self.deviation
+
+    @property
+    def velocity(self) -> Float[np.ndarray, "2"]:
+        return self.reference_rate + self.deviation_rate
+
+    @property
+    def applied(self) -> Float[np.ndarray, "2"]:
+        """Torque on the legs: the command, or the faulted drives' passive brake."""
+        return -BRAKE_DAMPING * self.velocity if self.braking else self.commanded
+
+    @property
+    def pace(self) -> float:
+        """Log cadence relative to GAIT_PERIOD."""
+        return self.smooth_level + self.drift + ADAPTATION * self.assistance
+
+    def step(self, dt: float) -> None:
+        """Advance the subject and the legs by dt [s]."""
+        rng, applied = self.rng, self.applied
+        self.elapsed += dt
+
+        # walking schedule: stand, then walk, stopping now and then
+        if self.elapsed >= self.next_switch:
+            self.walking = not self.walking
+            self.next_switch = self.elapsed + (
+                rng.exponential(STOP_EVERY) if self.walking else rng.uniform(*STOP_DURATION))
+        self.envelope = float(np.clip(self.envelope + (dt if self.walking else -dt) / WALK_RAMP, 0.0, 1.0))
+
+        # log cadence: treadmill speed changes, slow drift, adaptation to the assistance felt
+        if self.elapsed >= self.next_speed_change:
+            self.level = float(np.clip(self.level + rng.normal(0.0, SPEED_CHANGE_SD), -MAX_PACE_SHIFT, MAX_PACE_SHIFT))
+            self.next_speed_change += rng.exponential(SPEED_CHANGE_EVERY)
+        self.smooth_level += dt / SPEED_CHANGE_TIME * (self.level - self.smooth_level)
+        self.drift += -self.drift * dt / PACE_DRIFT_TIME + PACE_DRIFT_SD * np.sqrt(2 * dt / PACE_DRIFT_TIME) * rng.normal()
+        self.assistance += dt / ADAPTATION_TIME * (float(np.mean(applied * self.velocity)) - self.assistance)
+        pace = self.pace
+
+        # stride clock, with a fresh period and amplitude scale every stride
+        self.stride_angle += 2 * np.pi / GAIT_PERIOD * np.exp(pace) / self.stride_period_scale * dt
+        if self.stride_angle >= 2 * np.pi:
+            self.stride_angle -= 2 * np.pi
+            self.stride_period_scale = rng.lognormal(0.0, STRIDE_PERIOD_CV)
+            self.stride_amplitudes = np.array([self.stride_amplitudes[1], rng.lognormal(0.0, STRIDE_AMPLITUDE_CV)])
+        stride_fraction = self.stride_angle / (2 * np.pi)
+        amplitude = np.exp(AMPLITUDE_PER_CADENCE * pace) * (
+            (1 - stride_fraction) * self.stride_amplitudes[0] + stride_fraction * self.stride_amplitudes[1])
+
+        # reference hip angles, blended from the standing pose (encoders zeroed there)
+        angles = self.stride_angle * np.arange(1, 5)
+        shape = TRAJECTORY[:, 1::2] @ np.cos(angles) + TRAJECTORY[:, 2::2] @ np.sin(angles)
+        reference = smoothstep(self.envelope) * (TRAJECTORY[:, 0] + amplitude * shape)
+        self.reference, self.reference_rate = reference, (reference - self.reference) / dt
+
+        # the applied torque pushes the legs off the reference
+        restoring = HIP_DAMPING * self.deviation_rate + HIP_STIFFNESS * self.deviation
+        self.deviation_rate = self.deviation_rate + dt * (applied - restoring) / LEG_INERTIA
+        self.deviation = self.deviation + dt * self.deviation_rate
+
+    def sense(self) -> Float[np.ndarray, "3 2"]:
+        """Quantized encoder positions [rad], noisy velocities [rad/s] and measured torques [Nm]."""
+        return np.stack([
+            POSITION_QUANTUM * np.round(self.position / POSITION_QUANTUM),
+            self.velocity + self.rng.normal(0.0, VELOCITY_NOISE, 2),
+            self.applied + self.rng.normal(0.0, TORQUE_NOISE, 2),
+        ])
 
 
-def step_legs(legs: Legs, dt: float, rng: np.random.Generator) -> Legs:
-    """Advance the subject and the legs by dt [s]."""
-    elapsed = legs.elapsed + dt
+class SimulatedCandle:
+    """pyCandle.Candle stand-in whose two MD80 drives move simulated legs; readings refresh once per control step."""
 
-    # walking schedule: stand, then walk, stopping now and then
-    walking, next_switch = legs.walking, legs.next_switch
-    if elapsed >= next_switch:
-        walking = not walking
-        next_switch = elapsed + (rng.exponential(STOP_EVERY) if walking else rng.uniform(*STOP_DURATION))
-    envelope = float(np.clip(legs.envelope + (dt if walking else -dt) / WALK_RAMP, 0.0, 1.0))
+    def __init__(self, seed: int | None, drive_fault: bool, drop_every: float | None):
+        self.drive_fault, self.drop_every = drive_fault, drop_every
+        self.legs = Legs(np.random.default_rng(seed))
+        self.next_drop = None if drop_every is None else time.monotonic() + self.legs.rng.exponential(drop_every)
+        self.reading = self.legs.sense()
+        self.last_refresh = time.monotonic()
+        self.stalled_until = 0.0
+        self.md80s: list[SimpleNamespace] = []
 
-    # log cadence: treadmill speed changes, slow drift, adaptation to the assistance felt
-    level, next_speed_change = legs.level, legs.next_speed_change
-    if elapsed >= next_speed_change:
-        level = float(np.clip(level + rng.normal(0.0, SPEED_CHANGE_SD), -MAX_PACE_SHIFT, MAX_PACE_SHIFT))
-        next_speed_change += rng.exponential(SPEED_CHANGE_EVERY)
-    smooth_level = legs.smooth_level + dt / SPEED_CHANGE_TIME * (level - legs.smooth_level)
-    drift = legs.drift - legs.drift * dt / PACE_DRIFT_TIME + PACE_DRIFT_SD * np.sqrt(
-        2 * dt / PACE_DRIFT_TIME
-    ) * rng.normal()
-    velocity = legs.reference_rate + legs.deviation_rate
-    power = float(np.mean(legs.applied * velocity))
-    assistance = legs.assistance + dt / ADAPTATION_TIME * (power - legs.assistance)
-    pace = smooth_level + drift + ADAPTATION * assistance
-
-    # stride clock, with a fresh period and amplitude scale every stride
-    omega = 2 * np.pi / GAIT_PERIOD * np.exp(pace) / legs.stride_period_scale
-    stride_angle = legs.stride_angle + omega * dt
-    stride_period_scale, stride_amplitudes = legs.stride_period_scale, legs.stride_amplitudes
-    if stride_angle >= 2 * np.pi:
-        stride_angle -= 2 * np.pi
-        stride_period_scale = rng.lognormal(0.0, STRIDE_PERIOD_CV)
-        stride_amplitudes = np.array([stride_amplitudes[1], rng.lognormal(0.0, STRIDE_AMPLITUDE_CV)])
-    stride_fraction = stride_angle / (2 * np.pi)
-    amplitude = np.exp(AMPLITUDE_PER_CADENCE * pace) * (
-        (1 - stride_fraction) * stride_amplitudes[0] + stride_fraction * stride_amplitudes[1]
-    )
-
-    # reference hip angles, blended from the standing pose (encoders zeroed there)
-    angles = stride_angle * np.arange(1, 5)
-    shape = TRAJECTORY[:, 1::2] @ np.cos(angles) + TRAJECTORY[:, 2::2] @ np.sin(angles)
-    reference = smoothstep(envelope) * (TRAJECTORY[:, 0] + amplitude * shape)
-
-    # the command, or the faulted drives' passive brake, pushes the legs off the reference
-    applied = -BRAKE_DAMPING * velocity if legs.braking else legs.commanded
-    restoring = HIP_DAMPING * legs.deviation_rate + HIP_STIFFNESS * legs.deviation
-    deviation_rate = legs.deviation_rate + dt * (applied - restoring) / LEG_INERTIA
-
-    return legs._replace(
-        elapsed=elapsed, walking=walking, envelope=envelope, next_switch=next_switch,
-        level=level, smooth_level=smooth_level, drift=drift, assistance=assistance,
-        next_speed_change=next_speed_change, stride_angle=stride_angle,
-        stride_period_scale=stride_period_scale, stride_amplitudes=stride_amplitudes,
-        reference=reference, reference_rate=(reference - legs.reference) / dt,
-        deviation=legs.deviation + dt * deviation_rate, deviation_rate=deviation_rate, applied=applied,
-    )
-
-
-def sense(legs: Legs, rng: np.random.Generator) -> Float[np.ndarray, "3 2"]:
-    """Quantized encoder positions [rad], noisy velocities [rad/s] and measured torques [Nm]."""
-    return np.stack([
-        POSITION_QUANTUM * np.round((legs.reference + legs.deviation) / POSITION_QUANTUM),
-        legs.reference_rate + legs.deviation_rate + rng.normal(0.0, VELOCITY_NOISE, 2),
-        legs.applied + rng.normal(0.0, TORQUE_NOISE, 2),
-    ])
-
-
-def simulated_pycandle(seed: int | None, drive_fault: bool) -> SimpleNamespace:
-    """pyCandle stand-in whose two MD80 drives move simulated legs; readings refresh once per control step."""
-    rng = np.random.default_rng(seed)
-    legs = standing_legs(rng)
-    reading = sense(legs, rng)
-    last_refresh = time.monotonic()
-    stalled_until = 0.0
-
-    def refresh() -> None:
-        # the legs move for the time since the last refresh (stalls capped); reads freeze while the CAN link stalls
-        nonlocal legs, reading, last_refresh
+    def refresh(self) -> None:
+        """Move the legs for the time since the last refresh (stalls capped); reads freeze while the CAN link stalls."""
         now = time.monotonic()
-        if now - last_refresh < SAMPLING_STEP / 2:
+        if now - self.last_refresh < SAMPLING_STEP / 2:
             return
-        dt = min(now - last_refresh, 5 * SAMPLING_STEP) / SUBSTEPS
-        last_refresh = now
+        dt = min(now - self.last_refresh, 5 * SAMPLING_STEP) / SUBSTEPS
+        self.last_refresh = now
+        if self.next_drop is not None and now >= self.next_drop:
+            self.next_drop = now + self.legs.rng.exponential(self.drop_every)
+            self.drop("at random")
         for _ in range(SUBSTEPS):
-            legs = step_legs(legs, dt, rng)
-        if now >= stalled_until:
-            reading = sense(legs, rng)
+            self.legs.step(dt)
+        if now >= self.stalled_until:
+            self.reading = self.legs.sense()
 
-    def get(quantity: int, leg: int) -> float:
-        refresh()
-        return float(reading[quantity, leg])
+    def drop(self, why: str) -> None:
+        """The CAN connection drops, as on 2026-11-06: reads stall, then both drives brake until re-enabled."""
+        if self.legs.braking:
+            return
+        self.legs.braking = True
+        self.stalled_until = time.monotonic() + self.legs.rng.uniform(*STALL_DURATION)
+        print(f"mock dropped connection ({why}): reads stalled, drives braking passively until re-enabled")
 
-    def set_target_torque(leg: int, torque: float) -> None:
-        # as on 2026-11-06: a near-max command stalls the reads, then both drives brake for good
-        nonlocal legs, stalled_until
-        if drive_fault and not legs.braking and abs(torque) >= FAULT_TORQUE:
-            legs = legs._replace(braking=True)
-            stalled_until = time.monotonic() + rng.uniform(*STALL_DURATION)
-            print("drive fault: reads stalled, drives braking passively from now on")
-        commanded = np.where(np.arange(2) == leg, np.clip(torque, -MAX_TORQUE, MAX_TORQUE), legs.commanded)
-        legs = legs._replace(commanded=commanded)
+    def get(self, quantity: int, leg: int) -> float:
+        self.refresh()
+        return float(self.reading[quantity, leg])
 
-    def md80(leg: int) -> SimpleNamespace:
-        return SimpleNamespace(
-            getPosition=partial(get, 0, leg), getVelocity=partial(get, 1, leg), getTorque=partial(get, 2, leg),
-            setTargetTorque=partial(set_target_torque, leg), setMaxTorque=lambda torque: None,
-        )
+    def set_target_torque(self, leg: int, torque: float) -> None:
+        if self.drive_fault and abs(torque) >= FAULT_TORQUE:
+            self.drop("on a near-max command")
+        self.legs.commanded = np.where(
+            np.arange(2) == leg, np.clip(torque, -MAX_TORQUE, MAX_TORQUE), self.legs.commanded)
 
-    md80s = []
-    candle = SimpleNamespace(
-        md80s=md80s, ping=lambda: [100, 101], addMd80=lambda id: md80s.append(md80(len(md80s))),
-        controlMd80Mode=lambda id, mode: True, controlMd80Enable=lambda id, enable: True,
-        begin=lambda: None, end=lambda: None,
-    )
-    return SimpleNamespace(Candle=lambda baud, printing: candle, CAN_BAUD_1M=None, RAW_TORQUE=None)
+    def ping(self) -> list[int]:
+        return [100, 101]
+
+    def addMd80(self, id: int) -> None:
+        leg = len(self.md80s)
+        self.md80s.append(SimpleNamespace(
+            getPosition=partial(self.get, 0, leg), getVelocity=partial(self.get, 1, leg),
+            getTorque=partial(self.get, 2, leg), setTargetTorque=partial(self.set_target_torque, leg),
+            setMaxTorque=lambda torque: None))
+
+    def controlMd80Mode(self, id: int, mode: object) -> bool:
+        return True
+
+    def controlMd80Enable(self, id: int, on: bool) -> bool:
+        if on:
+            self.legs.braking = False
+        return True
+
+    def begin(self) -> None: ...
+
+    def end(self) -> None: ...
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, help="seed of the simulated subject's variability")
     parser.add_argument("--drive-fault", action="store_true",
-                        help="the first command over 11 Nm stalls the reads, then the drives only brake")
+                        help="a command over 11 Nm drops the connection: reads stall, then the drives only brake until re-enabled")
+    parser.add_argument("--drop-every", type=float, metavar="SECONDS",
+                        help="the connection to the drives drops at random, this long apart on average")
     args = parser.parse_args()
-    sys.modules["pyCandle"] = simulated_pycandle(args.seed, args.drive_fault)
+    candle = SimulatedCandle(args.seed, args.drive_fault, args.drop_every)
+    sys.modules["pyCandle"] = SimpleNamespace(Candle=lambda baud, printing: candle, CAN_BAUD_1M=None, RAW_TORQUE=None)
     runpy.run_path(str(Path(__file__).with_name("control_loop.py")), run_name="__main__")

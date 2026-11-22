@@ -80,7 +80,6 @@ if __name__ == "__main__":
 
                 if t >= next_report:
                     log = np.array(stretch)
-                    working = True
                     for leg, id in enumerate(drives.ids):
                         # a drive silent on the bus leaves pyCandle repeating its last reads
                         stall = longest_stall(log[:, 0], log[:, [3 + leg, 5 + leg, 7 + leg]])
@@ -91,11 +90,8 @@ if __name__ == "__main__":
                             outcome = "NO FRESH READS (drive silent on the CAN bus, values are the last ones it sent)"
                         elif stall >= STALL_REPORTED:
                             outcome += f", reads frozen for {stall:.2f} s"
-                        working &= outcome == "ok"
                         print(f"t={t:5.0f} s drive {id}: measured = {fit_gain:+.2f} x commanded {damping:+.2f} "
                               f"x velocity (rms {residual:.2f} Nm), moved {np.ptp(log[:, 7 + leg]):.3f} rad: {outcome}")
-                    if not working:
-                        drives.print_status()
                     stretch, next_report = [], next_report + REPORT_CYCLES * GAIT_PERIOD
 
                 next_tick = max(next_tick + SAMPLING_STEP, time.monotonic())

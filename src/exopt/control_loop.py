@@ -117,6 +117,7 @@ def main() -> None:
                 print(f"nothing connected for {IDLE_TIMEOUT / 60:g} min: exiting")
                 break
             raw_position, velocity, measured_torque = drives.read(now - start)
+            drives.watch()
 
             # logged positions are zeroed on the standing pose, re-taken whenever the subject stands still
             if np.any(np.abs(velocity) > STILL_SPEED):
@@ -132,12 +133,14 @@ def main() -> None:
             if stage != previous_stage:
                 print(f"running: gait period {2 * np.pi / estimator.omega:.3f} s" if stage == "running" else stage)
 
-            # zero torque until calibrated, and ramped down while the subject stands
+            # zero torque until calibrated, on a drive fault, and ramped down while the subject stands
             torque = np.zeros(2)
             if phase is not None:
                 if (message := streams.latest_message(profiles)) is not None:
                     player.request(message)
                 player.advance((now - last_tick) * estimator.omega / (2 * np.pi), engaged=stage == "running")
+                if drives.faulted:
+                    player.gain = 0.0
                 torque = player.torque(phase)
             last_tick = now
             drives.apply(torque)
@@ -145,7 +148,8 @@ def main() -> None:
             columns = dict(phase=phase, position=raw_position - standing_pose, velocity=velocity, torque=torque,
                            measured_torque=measured_torque)
             samples.send_json(
-                dict(time=now - start, stage=stage, profile_id=player.applied_id, gain=player.gain)
+                dict(time=now - start, stage=stage, profile_id=player.applied_id, gain=player.gain,
+                     drive_fault=drives.faulted)
                 | {f"{name}_{leg}": None if values is None else float(values[leg])
                    for name, values in columns.items() for leg in (0, 1)}
             )

@@ -95,8 +95,10 @@ def columns(samples: list[dict]) -> dict[str, np.ndarray]:
 
 
 def gait_slices(samples: dict, settings: Settings = DEFAULT) -> list[slice]:
-    """The valid gaits: spans between wraps of leg 0's phase covering a full cycle in the period range, legs swinging."""
+    """The valid gaits: spans between wraps of leg 0's phase covering a full cycle in the period range, legs swinging,
+    drives never faulted."""
     phase, time = np.asarray(samples["phase_0"], float), np.asarray(samples["time"], float)
+    fault = np.asarray(samples.get("drive_fault", np.zeros_like(time)), float) > 0
     cuts = [0, *(np.flatnonzero(np.diff(phase) < -np.pi) + 1), len(phase)]
 
     def valid(gait: slice) -> bool:
@@ -104,7 +106,7 @@ def gait_slices(samples: dict, settings: Settings = DEFAULT) -> list[slice]:
             return False
         swing = min(np.ptp(np.asarray(samples[f"position_{leg}"][gait], float)) for leg in (0, 1))
         period = time[gait.stop - 1] - time[gait.start]
-        return bool(np.ptp(phase[gait]) >= FULL_CYCLE and settings.min_period <= period <= settings.max_period
+        return bool(not fault[gait].any() and np.ptp(phase[gait]) >= FULL_CYCLE and settings.min_period <= period <= settings.max_period
                     and swing >= settings.min_swing)
 
     return [gait for gait in map(slice, cuts[:-1], cuts[1:]) if valid(gait)]
